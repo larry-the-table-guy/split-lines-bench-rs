@@ -44,10 +44,10 @@ mod x86_64 {
                 }
             }
         }
-        unsafe_tail(line_start, 16, input, out);
+        tail(line_start, 16, input, out);
     }
 
-    fn unsafe_tail<'input, 'buf>(
+    fn tail<'input, 'buf>(
         mut line_start: usize,
         chunk_size: usize,
         input: &'input str,
@@ -87,7 +87,7 @@ mod x86_64 {
                 }
             }
         }
-        unsafe_tail(line_start, 16, input, out);
+        tail(line_start, 16, input, out);
     }
 
     pub fn sse2_unroll<'input, 'buf>(input: &'input str, out: &'buf mut Vec<&'input str>) {
@@ -102,10 +102,7 @@ mod x86_64 {
                 let mut write_i = 0;
                 out.reserve(64);
                 let out_arr = out.spare_capacity_mut().get_unchecked_mut(..64);
-                while write_i < (64 - 16) {
-                    if chunk_i >= stop_chunk_i {
-                        break;
-                    }
+                while write_i < (64 - 16) && chunk_i < stop_chunk_i {
                     let v = _mm_loadu_si128(input.as_ptr().byte_add(chunk_i * 16).cast());
                     let mut mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, nl_v)) as u16;
                     while mask != 0 {
@@ -124,7 +121,7 @@ mod x86_64 {
                 out.set_len(out.len() + write_i);
             }
         }
-        unsafe_tail(line_start, 16, input, out);
+        tail(line_start, 16, input, out);
     }
 
     pub fn can_run_avx2() -> bool {
@@ -135,81 +132,75 @@ mod x86_64 {
     pub unsafe fn avx2<'input, 'buf>(input: &'input str, out: &'buf mut Vec<&'input str>) {
         // scan 32-byte chunks, then handle tail
         let mut line_start = 0;
-        unsafe {
-            let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
-            for (chunk_i, chunk) in input.as_bytes().chunks_exact(32).enumerate() {
-                let v = _mm256_loadu_si256(chunk.as_ptr().cast());
-                let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
-                while mask != 0 {
-                    let bit_pos = mask.trailing_zeros() as usize;
-                    let line_end = chunk_i * 32 + bit_pos;
-                    debug_assert!(line_start <= line_end);
-                    out.push(&input[line_start..line_end]);
-                    line_start = line_end + 1;
-                    mask &= mask - 1;
-                }
+        let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
+        for (chunk_i, chunk) in input.as_bytes().chunks_exact(32).enumerate() {
+            let v = _mm256_loadu_si256(chunk.as_ptr().cast());
+            let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
+            while mask != 0 {
+                let bit_pos = mask.trailing_zeros() as usize;
+                let line_end = chunk_i * 32 + bit_pos;
+                debug_assert!(line_start <= line_end);
+                out.push(&input[line_start..line_end]);
+                line_start = line_end + 1;
+                mask &= mask - 1;
             }
         }
-        unsafe_tail(line_start, 32, input, out);
+        tail(line_start, 32, input, out);
     }
 
     #[target_feature(enable = "avx2")]
     pub unsafe fn avx2_unsafe<'input, 'buf>(input: &'input str, out: &'buf mut Vec<&'input str>) {
         // scan 32-byte chunks, then handle tail
         let mut line_start = 0;
-        unsafe {
-            let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
-            for (chunk_i, chunk) in input.as_bytes().chunks_exact(32).enumerate() {
-                let v = _mm256_loadu_si256(chunk.as_ptr().cast());
-                let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
-                while mask != 0 {
-                    let bit_pos = mask.trailing_zeros() as usize;
-                    let line_end = chunk_i * 32 + bit_pos;
-                    out.push(input.get_unchecked(line_start..line_end));
-                    line_start = line_end + 1;
-                    mask &= mask - 1;
-                }
+        let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
+        for (chunk_i, chunk) in input.as_bytes().chunks_exact(32).enumerate() {
+            let v = _mm256_loadu_si256(chunk.as_ptr().cast());
+            let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
+            while mask != 0 {
+                let bit_pos = mask.trailing_zeros() as usize;
+                let line_end = chunk_i * 32 + bit_pos;
+                out.push(input.get_unchecked(line_start..line_end));
+                line_start = line_end + 1;
+                mask &= mask - 1;
             }
         }
-        unsafe_tail(line_start, 32, input, out);
+        tail(line_start, 32, input, out);
     }
 
     #[target_feature(enable = "avx2")]
     pub unsafe fn avx2_unroll<'input, 'buf>(input: &'input str, out: &'buf mut Vec<&'input str>) {
         // Key idea is to pull the allocation out of the innermost loop
         let mut line_start = 0;
-        unsafe {
-            let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
-            let mut chunk_i = 0;
-            let stop_chunk_i = input.len() / 32;
-            while chunk_i < stop_chunk_i {
-                let mut write_i = 0;
-                out.reserve(64);
-                let out_arr = out.spare_capacity_mut().get_unchecked_mut(..64);
-                // at most 32 items will be added per chunk
-                while write_i <= (64 - 32) {
-                    if chunk_i >= stop_chunk_i {
-                        break;
-                    }
-                    let v = _mm256_loadu_si256(input.as_ptr().byte_add(chunk_i * 32).cast());
-                    let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
-                    while mask != 0 {
-                        let bit_pos = mask.trailing_zeros() as usize;
-                        let line_end = chunk_i * 32 + bit_pos;
-                        debug_assert!(line_start <= line_end);
-                        out_arr
-                            .get_unchecked_mut(write_i)
-                            .write(input.get_unchecked(line_start..line_end));
-                        write_i += 1;
-                        line_start = line_end + 1;
-                        mask &= mask - 1;
-                    }
-                    chunk_i += 1;
+        let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
+        let mut chunk_i = 0;
+        let stop_chunk_i = input.len() / 32;
+        while chunk_i < stop_chunk_i {
+            let mut write_i = 0;
+            // this is the only function call in the loop. Vector registers have to be reloaded
+            // after a function call. That's why we go through the trouble of removing it from the
+            // inner loop.
+            out.reserve(64);
+            let out_arr = out.spare_capacity_mut().get_unchecked_mut(..64);
+            // at most 32 items will be added per chunk
+            while write_i <= (64 - 32) && chunk_i < stop_chunk_i {
+                let v = _mm256_loadu_si256(input.as_ptr().byte_add(chunk_i * 32).cast());
+                let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
+                while mask != 0 {
+                    let bit_pos = mask.trailing_zeros() as usize;
+                    let line_end = chunk_i * 32 + bit_pos;
+                    debug_assert!(line_start <= line_end);
+                    out_arr
+                        .get_unchecked_mut(write_i)
+                        .write(input.get_unchecked(line_start..line_end));
+                    write_i += 1;
+                    line_start = line_end + 1;
+                    mask &= mask - 1;
                 }
-                out.set_len(out.len() + write_i);
+                chunk_i += 1;
             }
+            out.set_len(out.len() + write_i);
         }
-        unsafe_tail(line_start, 32, input, out);
+        tail(line_start, 32, input, out);
     }
 
     #[cfg(feature = "nightly")]
