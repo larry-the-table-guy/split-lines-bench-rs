@@ -8,106 +8,193 @@
     feature(stdarch_x86_avx512)
 )]
 
-fn std(input: &str) -> Vec<&str> {
-    input.lines().collect()
-}
-
-fn std_reuse<'input, 'buf>(input: &'input str, out: &'buf mut Vec<&'input str>) {
-    for line in input.lines() {
-        out.push(line);
+mod slice {
+    pub fn std(input: &str) -> Vec<&str> {
+        input.lines().collect()
     }
-}
 
-#[cfg(target_arch = "x86_64")]
-mod x86_64 {
-    use std::arch::x86_64::*;
+    pub fn std_reuse<'input>(input: &'input str, out: &mut Vec<&'input str>) {
+        for line in input.lines() {
+            out.push(line);
+        }
+    }
 
-    pub fn sse2<'input, 'buf>(input: &'input str, out: &'buf mut Vec<&'input str>) {
-        // scan 16-byte chunks, then handle tail
-        let mut line_start = 0;
-        unsafe {
-            let nl_v = _mm_loadu_si128([b'\n'; 16].as_ptr().cast());
-            for (chunk_i, chunk) in input.as_bytes().chunks_exact(16).enumerate() {
-                let v = _mm_loadu_si128(chunk.as_ptr().cast());
-                let mut mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, nl_v)) as u16;
+    #[cfg(target_arch = "x86_64")]
+    pub mod x86_64 {
+        use std::arch::x86_64::*;
+
+        pub fn sse2<'input>(input: &'input str, out: &mut Vec<&'input str>) {
+            // scan 16-byte chunks, then handle tail
+            let mut line_start = 0;
+            unsafe {
+                let nl_v = _mm_loadu_si128([b'\n'; 16].as_ptr().cast());
+                for (chunk_i, chunk) in input.as_bytes().chunks_exact(16).enumerate() {
+                    let v = _mm_loadu_si128(chunk.as_ptr().cast());
+                    let mut mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, nl_v)) as u16;
+                    while mask != 0 {
+                        /*
+                        abcdefNhijklNmoN
+                        (reversed, so first char is lowest bit)
+                        1001000001000000
+                         */
+                        let bit_pos = mask.trailing_zeros() as usize;
+                        let line_end = chunk_i * 16 + bit_pos;
+                        out.push(&input[line_start..line_end]);
+                        line_start = line_end + 1;
+                        mask &= mask - 1;
+                    }
+                }
+            }
+            tail(line_start, 16, input, out);
+        }
+
+        fn tail<'input>(
+            mut line_start: usize,
+            chunk_size: usize,
+            input: &'input str,
+            out: &mut Vec<&'input str>,
+        ) {
+            // handle last bytes
+            for i in (input.len() & !(chunk_size - 1))..input.len() {
+                if input.as_bytes()[i] != b'\n' {
+                    continue;
+                }
+                debug_assert!(line_start <= i);
+                out.push(unsafe { input.get_unchecked(line_start..i) });
+                line_start = i + 1;
+            }
+            // handle last line. omit if empty
+            if line_start != input.len() {
+                debug_assert!(line_start <= input.len());
+                out.push(unsafe { input.get_unchecked(line_start..) });
+            }
+        }
+
+        pub fn sse2_unsafe<'input>(input: &'input str, out: &mut Vec<&'input str>) {
+            // scan 16-byte chunks, then handle tail
+            let mut line_start = 0;
+            unsafe {
+                let nl_v = _mm_loadu_si128([b'\n'; 16].as_ptr().cast());
+                for (chunk_i, chunk) in input.as_bytes().chunks_exact(16).enumerate() {
+                    let v = _mm_loadu_si128(chunk.as_ptr().cast());
+                    let mut mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, nl_v)) as u16;
+                    while mask != 0 {
+                        let bit_pos = mask.trailing_zeros() as usize;
+                        let line_end = chunk_i * 16 + bit_pos;
+                        debug_assert!(line_start <= line_end);
+                        out.push(input.get_unchecked(line_start..line_end));
+                        line_start = line_end + 1;
+                        mask &= mask - 1;
+                    }
+                }
+            }
+            tail(line_start, 16, input, out);
+        }
+
+        pub fn sse2_unroll<'input>(input: &'input str, out: &mut Vec<&'input str>) {
+            // Key idea is to pull the allocation out of the innermost loop
+
+            let mut line_start = 0;
+            unsafe {
+                let nl_v = _mm_loadu_si128([b'\n'; 16].as_ptr().cast());
+                let mut chunk_i = 0;
+                let stop_chunk_i = input.len() / 16;
+                while chunk_i < stop_chunk_i {
+                    let mut write_i = 0;
+                    out.reserve(64);
+                    let out_arr = out.spare_capacity_mut().get_unchecked_mut(..64);
+                    while write_i < (64 - 16) && chunk_i < stop_chunk_i {
+                        let v = _mm_loadu_si128(input.as_ptr().byte_add(chunk_i * 16).cast());
+                        let mut mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, nl_v)) as u16;
+                        while mask != 0 {
+                            let bit_pos = mask.trailing_zeros() as usize;
+                            let line_end = chunk_i * 16 + bit_pos;
+                            debug_assert!(line_start <= line_end);
+                            out_arr
+                                .get_unchecked_mut(write_i)
+                                .write(input.get_unchecked(line_start..line_end));
+                            write_i += 1;
+                            line_start = line_end + 1;
+                            mask &= mask - 1;
+                        }
+                        chunk_i += 1;
+                    }
+                    out.set_len(out.len() + write_i);
+                }
+            }
+            tail(line_start, 16, input, out);
+        }
+
+        pub fn can_run_avx2() -> bool {
+            is_x86_feature_detected!("avx2")
+        }
+
+        #[target_feature(enable = "avx2")]
+        pub unsafe fn avx2<'input>(input: &'input str, out: &mut Vec<&'input str>) {
+            // scan 32-byte chunks, then handle tail
+            let mut line_start = 0;
+            let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
+            for (chunk_i, chunk) in input.as_bytes().chunks_exact(32).enumerate() {
+                let v = _mm256_loadu_si256(chunk.as_ptr().cast());
+                let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
                 while mask != 0 {
-                    /*
-                    abcdefNhijklNmoN
-                    (reversed, so first char is lowest bit)
-                    1001000001000000
-                     */
                     let bit_pos = mask.trailing_zeros() as usize;
-                    let line_end = chunk_i * 16 + bit_pos;
+                    let line_end = chunk_i * 32 + bit_pos;
+                    debug_assert!(line_start <= line_end);
                     out.push(&input[line_start..line_end]);
                     line_start = line_end + 1;
                     mask &= mask - 1;
                 }
             }
+            tail(line_start, 32, input, out);
         }
-        tail(line_start, 16, input, out);
-    }
 
-    fn tail<'input, 'buf>(
-        mut line_start: usize,
-        chunk_size: usize,
-        input: &'input str,
-        out: &'buf mut Vec<&'input str>,
-    ) {
-        // handle last bytes
-        for i in (input.len() & !(chunk_size - 1))..input.len() {
-            if input.as_bytes()[i] != b'\n' {
-                continue;
-            }
-            debug_assert!(line_start <= i);
-            out.push(unsafe { input.get_unchecked(line_start..i) });
-            line_start = i + 1;
-        }
-        // handle last line. omit if empty
-        if line_start != input.len() {
-            debug_assert!(line_start <= input.len());
-            out.push(unsafe { input.get_unchecked(line_start..) });
-        }
-    }
-
-    pub fn sse2_unsafe<'input, 'buf>(input: &'input str, out: &'buf mut Vec<&'input str>) {
-        // scan 16-byte chunks, then handle tail
-        let mut line_start = 0;
-        unsafe {
-            let nl_v = _mm_loadu_si128([b'\n'; 16].as_ptr().cast());
-            for (chunk_i, chunk) in input.as_bytes().chunks_exact(16).enumerate() {
-                let v = _mm_loadu_si128(chunk.as_ptr().cast());
-                let mut mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, nl_v)) as u16;
+        #[target_feature(enable = "avx2")]
+        pub unsafe fn avx2_unsafe<'input>(
+            input: &'input str,
+            out: &mut Vec<&'input str>,
+        ) {
+            // scan 32-byte chunks, then handle tail
+            let mut line_start = 0;
+            let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
+            for (chunk_i, chunk) in input.as_bytes().chunks_exact(32).enumerate() {
+                let v = _mm256_loadu_si256(chunk.as_ptr().cast());
+                let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
                 while mask != 0 {
                     let bit_pos = mask.trailing_zeros() as usize;
-                    let line_end = chunk_i * 16 + bit_pos;
-                    debug_assert!(line_start <= line_end);
+                    let line_end = chunk_i * 32 + bit_pos;
                     out.push(input.get_unchecked(line_start..line_end));
                     line_start = line_end + 1;
                     mask &= mask - 1;
                 }
             }
+            tail(line_start, 32, input, out);
         }
-        tail(line_start, 16, input, out);
-    }
 
-    pub fn sse2_unroll<'input, 'buf>(input: &'input str, out: &'buf mut Vec<&'input str>) {
-        // Key idea is to pull the allocation out of the innermost loop
-
-        let mut line_start = 0;
-        unsafe {
-            let nl_v = _mm_loadu_si128([b'\n'; 16].as_ptr().cast());
+        #[target_feature(enable = "avx2")]
+        pub unsafe fn avx2_unroll<'input>(
+            input: &'input str,
+            out: &mut Vec<&'input str>,
+        ) {
+            // Key idea is to pull the allocation out of the innermost loop
+            let mut line_start = 0;
+            let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
             let mut chunk_i = 0;
-            let stop_chunk_i = input.len() / 16;
+            let stop_chunk_i = input.len() / 32;
             while chunk_i < stop_chunk_i {
                 let mut write_i = 0;
+                // this is the only function call in the loop. Vector registers have to be reloaded
+                // after a function call. That's why we go through the trouble of removing it from the
+                // inner loop.
                 out.reserve(64);
                 let out_arr = out.spare_capacity_mut().get_unchecked_mut(..64);
-                while write_i < (64 - 16) && chunk_i < stop_chunk_i {
-                    let v = _mm_loadu_si128(input.as_ptr().byte_add(chunk_i * 16).cast());
-                    let mut mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, nl_v)) as u16;
+                // at most 32 items will be added per chunk
+                while write_i <= (64 - 32) && chunk_i < stop_chunk_i {
+                    let v = _mm256_loadu_si256(input.as_ptr().byte_add(chunk_i * 32).cast());
+                    let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
                     while mask != 0 {
                         let bit_pos = mask.trailing_zeros() as usize;
-                        let line_end = chunk_i * 16 + bit_pos;
+                        let line_end = chunk_i * 32 + bit_pos;
                         debug_assert!(line_start <= line_end);
                         out_arr
                             .get_unchecked_mut(write_i)
@@ -120,113 +207,166 @@ mod x86_64 {
                 }
                 out.set_len(out.len() + write_i);
             }
+            tail(line_start, 32, input, out);
         }
-        tail(line_start, 16, input, out);
-    }
-
-    pub fn can_run_avx2() -> bool {
-        is_x86_feature_detected!("avx2")
-    }
-
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn avx2<'input, 'buf>(input: &'input str, out: &'buf mut Vec<&'input str>) {
-        // scan 32-byte chunks, then handle tail
-        let mut line_start = 0;
-        let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
-        for (chunk_i, chunk) in input.as_bytes().chunks_exact(32).enumerate() {
-            let v = _mm256_loadu_si256(chunk.as_ptr().cast());
-            let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
-            while mask != 0 {
-                let bit_pos = mask.trailing_zeros() as usize;
-                let line_end = chunk_i * 32 + bit_pos;
-                debug_assert!(line_start <= line_end);
-                out.push(&input[line_start..line_end]);
-                line_start = line_end + 1;
-                mask &= mask - 1;
-            }
-        }
-        tail(line_start, 32, input, out);
-    }
-
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn avx2_unsafe<'input, 'buf>(input: &'input str, out: &'buf mut Vec<&'input str>) {
-        // scan 32-byte chunks, then handle tail
-        let mut line_start = 0;
-        let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
-        for (chunk_i, chunk) in input.as_bytes().chunks_exact(32).enumerate() {
-            let v = _mm256_loadu_si256(chunk.as_ptr().cast());
-            let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
-            while mask != 0 {
-                let bit_pos = mask.trailing_zeros() as usize;
-                let line_end = chunk_i * 32 + bit_pos;
-                out.push(input.get_unchecked(line_start..line_end));
-                line_start = line_end + 1;
-                mask &= mask - 1;
-            }
-        }
-        tail(line_start, 32, input, out);
-    }
-
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn avx2_unroll<'input, 'buf>(input: &'input str, out: &'buf mut Vec<&'input str>) {
-        // Key idea is to pull the allocation out of the innermost loop
-        let mut line_start = 0;
-        let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
-        let mut chunk_i = 0;
-        let stop_chunk_i = input.len() / 32;
-        while chunk_i < stop_chunk_i {
-            let mut write_i = 0;
-            // this is the only function call in the loop. Vector registers have to be reloaded
-            // after a function call. That's why we go through the trouble of removing it from the
-            // inner loop.
-            out.reserve(64);
-            let out_arr = out.spare_capacity_mut().get_unchecked_mut(..64);
-            // at most 32 items will be added per chunk
-            while write_i <= (64 - 32) && chunk_i < stop_chunk_i {
-                let v = _mm256_loadu_si256(input.as_ptr().byte_add(chunk_i * 32).cast());
-                let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
-                while mask != 0 {
-                    let bit_pos = mask.trailing_zeros() as usize;
-                    let line_end = chunk_i * 32 + bit_pos;
-                    debug_assert!(line_start <= line_end);
-                    out_arr
-                        .get_unchecked_mut(write_i)
-                        .write(input.get_unchecked(line_start..line_end));
-                    write_i += 1;
-                    line_start = line_end + 1;
-                    mask &= mask - 1;
-                }
-                chunk_i += 1;
-            }
-            out.set_len(out.len() + write_i);
-        }
-        tail(line_start, 32, input, out);
-    }
-
-    #[cfg(feature = "nightly")]
-    pub fn can_run_avx512_compress() -> bool {
-        is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vbmi")
-            && is_x86_feature_detected!("avx512vbmi2")
-    }
-
-    #[cfg(feature = "nightly")]
-    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi2")]
-    pub unsafe fn avx512_compress<'input, 'buf>(
-        input: &'input str,
-        out: &'buf mut Vec<&'input str>,
-    ) {
-        // TODO
-        // get chunk
-        // make newline bitmask
-        // compute offsets, carrying prev line start
-        // compress and store
-        todo!("implement avx512")
     }
 }
 
-fn reset_vector<'a, 'b, T: ?Sized>(mut vec: Vec<&'a T>) -> Vec<&'b T> {
+mod compressed {
+    pub struct LineIndex {
+        /// Low 16 bits of each newline's index
+        /// One per line.
+        pub lows: Vec<u16>,
+        /// d[i] is the first index into 'lows' where the high bits are i
+        /// One per 64KB of input.
+        pub high_starts: Vec<usize>,
+    }
+
+    pub fn iter(input: &str, out: &mut LineIndex) {
+        for chunk in input.as_bytes().chunks(1 << 16) {
+            out.high_starts.push(out.lows.len());
+            for (idx, _) in chunk.iter().enumerate().filter(|e| *e.1 == b'\n') {
+                out.lows.push(idx as u16);
+            }
+        }
+    }
+
+    /// Assumes high_start has already been written
+    pub fn tail(chunk_size: usize, input: &str, out: &mut LineIndex) {
+        let base = input.len() & !(chunk_size - 1);
+        for (idx, _) in input.as_bytes()[base..]
+            .iter()
+            .enumerate()
+            .filter(|e| *e.1 == b'\n')
+        {
+            out.lows.push(base as u16 + idx as u16);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub mod x86_64 {
+        use crate::compressed::*;
+        use std::arch::x86_64::*;
+
+        #[no_mangle]
+        pub fn sse2(input: &str, out: &mut LineIndex) {
+            let nl_v = unsafe { _mm_loadu_si128([b'\n'; 16].as_ptr().cast()) };
+            for chunk_64k in input.as_bytes().chunks(1 << 16) {
+                out.high_starts.push(out.lows.len());
+                for (chunk_idx, chunk) in chunk_64k.chunks_exact(16).enumerate() {
+                    unsafe {
+                        let v = _mm_loadu_si128(chunk.as_ptr().cast());
+                        let mut mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, nl_v)) as u16;
+                        while mask != 0 {
+                            let bit_pos = mask.trailing_zeros() as u16;
+                            out.lows.push(chunk_idx as u16 * 16 + bit_pos);
+                            mask &= mask - 1;
+                        }
+                    }
+                }
+            }
+            tail(16, input, out);
+        }
+
+        #[no_mangle]
+        pub fn sse2_unroll(input: &str, out: &mut LineIndex) {
+            let nl_v = unsafe { _mm_loadu_si128([b'\n'; 16].as_ptr().cast()) };
+            for chunk_64k in input.as_bytes().chunks(1 << 16) {
+                out.high_starts.push(out.lows.len());
+                let mut chunk_i = 0;
+                let stop_chunk_i = chunk_64k.len() / 16;
+                while chunk_i < stop_chunk_i {
+                    let mut write_i = 0;
+                    out.lows.reserve(64);
+                    unsafe {
+                        let out_arr = out.lows.spare_capacity_mut().get_unchecked_mut(..64);
+                        while write_i <= (64 - 16) && chunk_i < stop_chunk_i {
+                            let v = _mm_loadu_si128(chunk_64k.as_ptr().add(chunk_i * 16).cast());
+                            let mut mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, nl_v)) as u16;
+                            while mask != 0 {
+                                let bit_pos = mask.trailing_zeros() as u16;
+                                out_arr
+                                    .get_unchecked_mut(write_i)
+                                    .write(chunk_i as u16 * 16 + bit_pos);
+                                write_i += 1;
+                                mask &= mask - 1;
+                            }
+                            chunk_i += 1;
+                        }
+                        out.lows.set_len(out.lows.len() + write_i);
+                    }
+                }
+            }
+            tail(16, input, out);
+        }
+
+        pub fn can_run_avx2() -> bool {
+            is_x86_feature_detected!("avx2")
+        }
+
+        #[target_feature(enable = "avx2,bmi1")]
+        #[no_mangle]
+        pub unsafe fn avx2_unroll(input: &str, out: &mut LineIndex) {
+            let nl_v = unsafe { _mm256_loadu_si256([b'\n'; 32].as_ptr().cast()) };
+            for chunk_64k in input.as_bytes().chunks(1 << 16) {
+                out.high_starts.push(out.lows.len());
+                let mut chunk_i = 0;
+                let stop_chunk_i = chunk_64k.len() / 32;
+                while chunk_i < stop_chunk_i {
+                    let mut write_i = 0;
+                    out.lows.reserve(64);
+                    unsafe {
+                        let out_arr = out.lows.spare_capacity_mut().get_unchecked_mut(..64);
+                        while write_i <= (64 - 32) && chunk_i < stop_chunk_i {
+                            let v = _mm256_loadu_si256(chunk_64k.as_ptr().add(chunk_i * 32).cast());
+                            let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
+                            while mask != 0 {
+                                let bit_pos = mask.trailing_zeros() as u16;
+                                out_arr
+                                    .get_unchecked_mut(write_i)
+                                    .write(chunk_i as u16 * 32 + bit_pos);
+                                write_i += 1;
+                                mask &= mask - 1;
+                            }
+                            chunk_i += 1;
+                        }
+                        out.lows.set_len(out.lows.len() + write_i);
+                    }
+                }
+            }
+            tail(32, input, out);
+        }
+
+        #[cfg(feature = "nightly")]
+        pub fn can_run_avx512_compress() -> bool {
+            is_x86_feature_detected!("popcnt")
+                && is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vbmi2")
+        }
+
+        #[allow(unused)]
+        #[cfg(feature = "nightly")]
+        #[target_feature(enable = "popcnt,avx512f,avx512bw,avx512vbmi2")]
+        pub unsafe fn avx512_compress(input: &str, out: &mut LineIndex) {
+            const IDX_ARR: [u8; 64] = {
+                let mut t = [0u8; 64];
+                let mut i = 0;
+                while i < t.len() {
+                    t[i] = i as u8;
+                    i += 1;
+                }
+                t
+            };
+            todo!("reimplement");
+            let mut line_start = 0;
+            let nl_v = _mm512_set1_epi8(b'\n' as i8);
+            let idx_v = _mm512_loadu_epi8(IDX_ARR.as_ptr().cast());
+        }
+    }
+}
+
+fn reset_vector<'b, T: ?Sized>(mut vec: Vec<&T>) -> Vec<&'b T> {
     vec.clear();
     let cap = vec.capacity();
     let ptr = vec.as_mut_ptr();
@@ -253,7 +393,8 @@ fn prep_vec_range<const M: usize, const N: usize>(vec: &mut Vec<u8>) -> usize {
     vec.len().min(64 * 1024 * 1024)
 }
 
-type SplitFn = for<'a, 'b> fn(&'a str, &'b mut Vec<&'a str>);
+type SliceSplitFn = for<'a, 'b> fn(&'a str, &'b mut Vec<&'a str>);
+type CompressSplitFn = fn(&str, &mut compressed::LineIndex);
 type FeatCheckFn = fn() -> bool;
 
 fn main() {
@@ -272,93 +413,126 @@ fn main() {
             vec.len().min(64 * 1024 * 1024)
         }),
     ];
-    let bench_cases: &[(&str, SplitFn)] = &[
-        ("std_reuse", std_reuse),
+    let slice_bench_cases: &[(&str, FeatCheckFn, SliceSplitFn)] = &[
+        ("std_reuse", || true, slice::std_reuse),
         #[cfg(target_arch = "x86_64")]
-        ("sse2", x86_64::sse2),
+        ("sse2", || true, slice::x86_64::sse2),
         #[cfg(target_arch = "x86_64")]
-        ("sse2_unsafe", x86_64::sse2_unsafe),
+        ("sse2_unsafe", || true, slice::x86_64::sse2_unsafe),
         #[cfg(target_arch = "x86_64")]
-        ("sse2_unroll", x86_64::sse2_unroll),
+        ("sse2_unroll", || true, slice::x86_64::sse2_unroll),
+        #[cfg(target_arch = "x86_64")]
+        ("avx2", slice::x86_64::can_run_avx2, |a, b| unsafe {
+            slice::x86_64::avx2(a, b)
+        }),
+        #[cfg(target_arch = "x86_64")]
+        ("avx2_unsafe", slice::x86_64::can_run_avx2, |a, b| unsafe {
+            slice::x86_64::avx2_unsafe(a, b)
+        }),
+        #[cfg(target_arch = "x86_64")]
+        ("avx2_unroll", slice::x86_64::can_run_avx2, |a, b| unsafe {
+            slice::x86_64::avx2_unroll(a, b)
+        }),
     ];
-    let opt_bench_cases: &[(&str, FeatCheckFn, SplitFn)] = &[
+    let compressed_bench_cases: &[(&str, FeatCheckFn, CompressSplitFn)] = &[
+        ("iter", || true, compressed::iter),
         #[cfg(target_arch = "x86_64")]
-        ("avx2", x86_64::can_run_avx2, |a, b| unsafe {
-            x86_64::avx2(a, b)
-        }),
+        ("sse2", || true, compressed::x86_64::sse2),
         #[cfg(target_arch = "x86_64")]
-        ("avx2_unsafe", x86_64::can_run_avx2, |a, b| unsafe {
-            x86_64::avx2_unsafe(a, b)
-        }),
+        ("sse2 unroll", || true, compressed::x86_64::sse2_unroll),
         #[cfg(target_arch = "x86_64")]
-        ("avx2_unroll", x86_64::can_run_avx2, |a, b| unsafe {
-            x86_64::avx2_unroll(a, b)
-        }),
-        /*
+        (
+            "avx2 unroll",
+            compressed::x86_64::can_run_avx2,
+            |a, b| unsafe { compressed::x86_64::avx2_unroll(a, b) },
+        ),
         #[cfg(all(feature = "nightly", target_arch = "x86_64"))]
         (
-        "avx512_compress",
-        x86_64::can_run_avx512_compress,
-        |a, b| unsafe { x86_64::avx512_compress(a, b) },
-        )*/
+            "avx512",
+            compressed::x86_64::can_run_avx512_compress,
+            |a, b| unsafe { compressed::x86_64::avx512_compress(a, b) },
+        ),
     ];
 
     let mut b = vec![b'a'; 1024 * 1024 * 1024];
 
     // pre-fill the vec (beyond just reserving) so that the first fn doesn't pay for all the page
     // misses (some OSs may give CoW zero pages for `Vec::with_capacity(...)` )
-    let mut pool_out_buf = black_box(vec![""; 64 * 1024 * 1024]);
+    let mut pool_out_slice_buf = black_box(vec![""; 64 * 1024 * 1024]);
+    let mut out_compressed_buf = compressed::LineIndex {
+        lows: Vec::with_capacity(64 * 1024 * 1024),
+        high_starts: Vec::with_capacity(16),
+    };
+    let mut test_compressed_buf = compressed::LineIndex {
+        lows: Vec::new(),
+        high_starts: Vec::new(),
+    };
 
     for (stage_label, prep_fn) in benchmark_stages {
-        println!("\n\tstarting {stage_label}");
+        println!("\n\t\t{stage_label}");
         let len = prep_fn(&mut b);
         let input = std::str::from_utf8(&b[..len]).unwrap();
-        let mut out_buf = pool_out_buf;
+        let mut out_slice_buf = pool_out_slice_buf;
 
+        println!("\tslices");
         {
             let start = Instant::now();
-            black_box(std(input));
+            black_box(slice::std(input));
             let duration = start.elapsed().as_secs_f64();
             let thrpt = len as f64 / duration / 1_000_000.;
             println!("{fn_label:<13}: {thrpt:>8.0}", fn_label = "std");
         }
-        for (fn_label, fnc) in bench_cases {
-            out_buf.clear();
-            let start = Instant::now();
-            fnc(input, &mut out_buf);
-            let duration = start.elapsed().as_secs_f64();
-            black_box(&mut out_buf);
-            let thrpt = len as f64 / duration / 1_000_000.;
-            println!("{fn_label:<13}: {thrpt:>8.0}");
-        }
-        for (fn_label, feat_checker, fnc) in opt_bench_cases {
+        for (fn_label, feat_checker, fnc) in slice_bench_cases {
             if !feat_checker() {
                 println!("skipping {fn_label} because of missing CPU features");
             }
-            out_buf.clear();
+            out_slice_buf.clear();
             let start = Instant::now();
-            fnc(input, &mut out_buf);
+            fnc(input, &mut out_slice_buf);
             let duration = start.elapsed().as_secs_f64();
-            black_box(&mut out_buf);
+            black_box(&mut out_slice_buf);
             let thrpt = len as f64 / duration / 1_000_000.;
             println!("{fn_label:<13}: {thrpt:>8.0}");
         }
         // run first test case again to show that it's not sensitive to order (e.g. cache)
         {
             let start = Instant::now();
-            black_box(std(input));
+            black_box(slice::std(input));
             let duration = start.elapsed().as_secs_f64();
             let thrpt = len as f64 / duration / 1_000_000.;
             println!("{fn_label:<13}: {thrpt:>8.0}", fn_label = "std");
         }
 
-        pool_out_buf = reset_vector(out_buf);
+        println!("\tcompressed");
+        test_compressed_buf.lows.clear();
+        test_compressed_buf.high_starts.clear();
+        compressed::iter(input, &mut test_compressed_buf);
+        for (fn_label, feat_checker, fnc) in compressed_bench_cases {
+            if !feat_checker() {
+                println!("skipping {fn_label} because of missing CPU features");
+            }
+            out_compressed_buf.lows.clear();
+            out_compressed_buf.high_starts.clear();
+            let start = Instant::now();
+            fnc(input, &mut out_compressed_buf);
+            let duration = start.elapsed().as_secs_f64();
+            black_box(&mut out_compressed_buf);
+            let thrpt = len as f64 / duration / 1_000_000.;
+            println!("{fn_label:<13}: {thrpt:>8.0}");
+            debug_assert_eq!(out_compressed_buf.lows, test_compressed_buf.lows);
+            debug_assert_eq!(
+                out_compressed_buf.high_starts,
+                test_compressed_buf.high_starts
+            );
+        }
+
+        pool_out_slice_buf = reset_vector(out_slice_buf);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::*;
+    use crate::slice::*;
 
     static TEST_CASES: &[(&str, &[&str])] = &[
         ("", &[]),
@@ -447,20 +621,6 @@ mod tests {
         for (input, expected) in TEST_CASES {
             buf.clear();
             unsafe { x86_64::avx2_unroll(input, &mut buf) };
-            assert_eq!(expected, &buf, "input: `{input}`");
-        }
-    }
-
-    #[cfg(all(feature = "nightly", target_arch = "x86_64"))]
-    #[test]
-    fn test_avx512_compress() {
-        if !x86_64::can_run_avx512_compress() {
-            return;
-        }
-        let mut buf = Vec::new();
-        for (input, expected) in TEST_CASES {
-            buf.clear();
-            unsafe { x86_64::avx512_compress(input, &mut buf) };
             assert_eq!(expected, &buf, "input: `{input}`");
         }
     }
