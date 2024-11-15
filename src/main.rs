@@ -361,7 +361,7 @@ mod compressed {
                     let mut write_i = 0;
                     out.lows.reserve(256);
                     let out_arr = out.lows.spare_capacity_mut().get_unchecked_mut(..256);
-                    while write_i <= (265 - 64) && chunk_i < stop_chunk_i {
+                    while write_i <= (256 - 64) && chunk_i < stop_chunk_i {
                         let v = _mm512_loadu_si512(chunk_64k.as_ptr().add(chunk_i * 64).cast());
                         let mask = _mm512_cmpeq_epi8_mask(v, nl_v);
                         let num_lines = mask.count_ones();
