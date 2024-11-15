@@ -150,10 +150,7 @@ mod slice {
         }
 
         #[target_feature(enable = "avx2")]
-        pub unsafe fn avx2_unsafe<'input>(
-            input: &'input str,
-            out: &mut Vec<&'input str>,
-        ) {
+        pub unsafe fn avx2_unsafe<'input>(input: &'input str, out: &mut Vec<&'input str>) {
             // scan 32-byte chunks, then handle tail
             let mut line_start = 0;
             let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
@@ -172,10 +169,7 @@ mod slice {
         }
 
         #[target_feature(enable = "avx2")]
-        pub unsafe fn avx2_unroll<'input>(
-            input: &'input str,
-            out: &mut Vec<&'input str>,
-        ) {
+        pub unsafe fn avx2_unroll<'input>(input: &'input str, out: &mut Vec<&'input str>) {
             // Key idea is to pull the allocation out of the innermost loop
             let mut line_start = 0;
             let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
@@ -277,10 +271,10 @@ mod compressed {
                 let stop_chunk_i = chunk_64k.len() / 16;
                 while chunk_i < stop_chunk_i {
                     let mut write_i = 0;
-                    out.lows.reserve(64);
+                    out.lows.reserve(256);
                     unsafe {
-                        let out_arr = out.lows.spare_capacity_mut().get_unchecked_mut(..64);
-                        while write_i <= (64 - 16) && chunk_i < stop_chunk_i {
+                        let out_arr = out.lows.spare_capacity_mut().get_unchecked_mut(..256);
+                        while write_i <= (256 - 16) && chunk_i < stop_chunk_i {
                             let v = _mm_loadu_si128(chunk_64k.as_ptr().add(chunk_i * 16).cast());
                             let mut mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, nl_v)) as u16;
                             while mask != 0 {
@@ -314,24 +308,22 @@ mod compressed {
                 let stop_chunk_i = chunk_64k.len() / 32;
                 while chunk_i < stop_chunk_i {
                     let mut write_i = 0;
-                    out.lows.reserve(64);
-                    unsafe {
-                        let out_arr = out.lows.spare_capacity_mut().get_unchecked_mut(..64);
-                        while write_i <= (64 - 32) && chunk_i < stop_chunk_i {
-                            let v = _mm256_loadu_si256(chunk_64k.as_ptr().add(chunk_i * 32).cast());
-                            let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
-                            while mask != 0 {
-                                let bit_pos = mask.trailing_zeros() as u16;
-                                out_arr
-                                    .get_unchecked_mut(write_i)
-                                    .write(chunk_i as u16 * 32 + bit_pos);
-                                write_i += 1;
-                                mask &= mask - 1;
-                            }
-                            chunk_i += 1;
+                    out.lows.reserve(256);
+                    let out_arr = out.lows.spare_capacity_mut().get_unchecked_mut(..256);
+                    while write_i <= (256 - 32) && chunk_i < stop_chunk_i {
+                        let v = _mm256_loadu_si256(chunk_64k.as_ptr().add(chunk_i * 32).cast());
+                        let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
+                        while mask != 0 {
+                            let bit_pos = mask.trailing_zeros() as u16;
+                            out_arr
+                                .get_unchecked_mut(write_i)
+                                .write(chunk_i as u16 * 32 + bit_pos);
+                            write_i += 1;
+                            mask &= mask - 1;
                         }
-                        out.lows.set_len(out.lows.len() + write_i);
+                        chunk_i += 1;
                     }
+                    out.lows.set_len(out.lows.len() + write_i);
                 }
             }
             tail(32, input, out);
@@ -345,7 +337,6 @@ mod compressed {
                 && is_x86_feature_detected!("avx512vbmi2")
         }
 
-        #[allow(unused)]
         #[cfg(feature = "nightly")]
         #[target_feature(enable = "popcnt,avx512f,avx512bw,avx512vbmi2")]
         pub unsafe fn avx512_compress(input: &str, out: &mut LineIndex) {
@@ -358,10 +349,44 @@ mod compressed {
                 }
                 t
             };
-            todo!("reimplement");
-            let mut line_start = 0;
             let nl_v = _mm512_set1_epi8(b'\n' as i8);
             let idx_v = _mm512_loadu_epi8(IDX_ARR.as_ptr().cast());
+            let i16_32_v = _mm512_set1_epi16(32);
+            for chunk_64k in input.as_bytes().chunks(1 << 16) {
+                out.high_starts.push(out.lows.len());
+                let mut offset_v = _mm512_setzero_si512();
+                let mut chunk_i = 0;
+                let stop_chunk_i = chunk_64k.len() / 64;
+                while chunk_i < stop_chunk_i {
+                    let mut write_i = 0;
+                    out.lows.reserve(256);
+                    let out_arr = out.lows.spare_capacity_mut().get_unchecked_mut(..256);
+                    while write_i <= (265 - 64) && chunk_i < stop_chunk_i {
+                        let v = _mm512_loadu_si512(chunk_64k.as_ptr().add(chunk_i * 64).cast());
+                        let mask = _mm512_cmpeq_epi8_mask(v, nl_v);
+                        let idxs = _mm512_maskz_compress_epi8(mask, idx_v);
+                        // first half
+                        let low_idxs = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(idxs));
+                        let low_idxs = _mm512_add_epi16(low_idxs, offset_v);
+                        _mm512_storeu_si512(out_arr.as_mut_ptr().add(write_i).cast(), low_idxs);
+                        offset_v = _mm512_add_epi16(offset_v, i16_32_v);
+                        // second half
+                        let high_idxs = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64::<1>(idxs));
+                        let high_idxs = _mm512_add_epi16(high_idxs, offset_v);
+                        // if there are any results in high_idxs, then low must have been full, so
+                        // we can unconditionally write 64 bytes ahead of the previous addr
+                        _mm512_storeu_si512(
+                            out_arr.as_mut_ptr().add(write_i).byte_add(64).cast(),
+                            high_idxs,
+                        );
+                        offset_v = _mm512_add_epi16(offset_v, i16_32_v);
+                        write_i += mask.count_ones() as usize;
+                        chunk_i += 1;
+                    }
+                    out.lows.set_len(out.lows.len() + write_i);
+                }
+            }
+            tail(64, input, out);
         }
     }
 }
@@ -485,6 +510,7 @@ fn main() {
         for (fn_label, feat_checker, fnc) in slice_bench_cases {
             if !feat_checker() {
                 println!("skipping {fn_label} because of missing CPU features");
+                continue;
             }
             out_slice_buf.clear();
             let start = Instant::now();
@@ -510,6 +536,7 @@ fn main() {
         for (fn_label, feat_checker, fnc) in compressed_bench_cases {
             if !feat_checker() {
                 println!("skipping {fn_label} because of missing CPU features");
+                continue;
             }
             out_compressed_buf.lows.clear();
             out_compressed_buf.high_starts.clear();
