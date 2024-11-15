@@ -337,6 +337,7 @@ mod compressed {
                 && is_x86_feature_detected!("avx512vbmi2")
         }
 
+        #[inline(never)]
         #[cfg(feature = "nightly")]
         #[target_feature(enable = "popcnt,avx512f,avx512bw,avx512vbmi2")]
         pub unsafe fn avx512_compress(input: &str, out: &mut LineIndex) {
