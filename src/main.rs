@@ -351,7 +351,7 @@ mod compressed {
             };
             let nl_v = _mm512_set1_epi8(b'\n' as i8);
             let idx_v = _mm512_loadu_epi8(IDX_ARR.as_ptr().cast());
-            let i16_32_v = _mm512_set1_epi16(32);
+            let i16_64_v = _mm512_set1_epi16(64);
             for chunk_64k in input.as_bytes().chunks(1 << 16) {
                 out.high_starts.push(out.lows.len());
                 let mut offset_v = _mm512_setzero_si512();
@@ -369,7 +369,6 @@ mod compressed {
                         let low_idxs = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(idxs));
                         let low_idxs = _mm512_add_epi16(low_idxs, offset_v);
                         _mm512_storeu_si512(out_arr.as_mut_ptr().add(write_i).cast(), low_idxs);
-                        offset_v = _mm512_add_epi16(offset_v, i16_32_v);
                         // second half
                         let high_idxs = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64::<1>(idxs));
                         let high_idxs = _mm512_add_epi16(high_idxs, offset_v);
@@ -379,7 +378,7 @@ mod compressed {
                             out_arr.as_mut_ptr().add(write_i).byte_add(64).cast(),
                             high_idxs,
                         );
-                        offset_v = _mm512_add_epi16(offset_v, i16_32_v);
+                        offset_v = _mm512_add_epi16(offset_v, i16_64_v);
                         write_i += mask.count_ones() as usize;
                         chunk_i += 1;
                     }
