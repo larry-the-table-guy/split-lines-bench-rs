@@ -364,22 +364,28 @@ mod compressed {
                     while write_i <= (265 - 64) && chunk_i < stop_chunk_i {
                         let v = _mm512_loadu_si512(chunk_64k.as_ptr().add(chunk_i * 64).cast());
                         let mask = _mm512_cmpeq_epi8_mask(v, nl_v);
-                        let idxs = _mm512_maskz_compress_epi8(mask, idx_v);
-                        // first half
-                        let low_idxs = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(idxs));
-                        let low_idxs = _mm512_add_epi16(low_idxs, offset_v);
-                        _mm512_storeu_si512(out_arr.as_mut_ptr().add(write_i).cast(), low_idxs);
-                        // second half
-                        let high_idxs = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64::<1>(idxs));
-                        let high_idxs = _mm512_add_epi16(high_idxs, offset_v);
-                        // if there are any results in high_idxs, then low must have been full, so
-                        // we can unconditionally write 64 bytes ahead of the previous addr
-                        _mm512_storeu_si512(
-                            out_arr.as_mut_ptr().add(write_i).byte_add(64).cast(),
-                            high_idxs,
-                        );
+                        let num_lines = mask.count_ones();
+                        if mask != 0 {
+                            let idxs = _mm512_maskz_compress_epi8(mask, idx_v);
+                            // first half
+                            let low_idxs = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(idxs));
+                            let low_idxs = _mm512_add_epi16(low_idxs, offset_v);
+                            _mm512_storeu_si512(out_arr.as_mut_ptr().add(write_i).cast(), low_idxs);
+                            // second half
+                            if num_lines > 32 {
+                                let high_idxs =
+                                    _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64::<1>(idxs));
+                                let high_idxs = _mm512_add_epi16(high_idxs, offset_v);
+                                // if there are any results in high_idxs, then low must have been full, so
+                                // we can unconditionally write 64 bytes ahead of the previous addr
+                                _mm512_storeu_si512(
+                                    out_arr.as_mut_ptr().add(write_i).byte_add(64).cast(),
+                                    high_idxs,
+                                );
+                            }
+                        }
                         offset_v = _mm512_add_epi16(offset_v, i16_64_v);
-                        write_i += mask.count_ones() as usize;
+                        write_i += num_lines as usize;
                         chunk_i += 1;
                     }
                     out.lows.set_len(out.lows.len() + write_i);
