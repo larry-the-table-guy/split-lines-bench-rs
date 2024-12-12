@@ -70,8 +70,9 @@ The `sse2_unrollx4` variants perform very well and are probably the easiest to i
 | sse2_unrollx4 | 17145 | 3855 | 4656 | 5987 | 4913 | 6191 | 9010 | 791 |
 | avx2          | 14854 | 2051 | 2477 | 3411 | 3033 | 3873 | 5683 | 309 |
 | avx2_unsafe   | 14854 | 2786 | 3278 | 4266 | 3615 | 4321 | 6088 | 635 |
-| avx2_unrollx2 | 18567 | 2940 | 3563 | 4622 | 3907 | 5138 | 7794 | 797 |
-| avx2_unroll   | 19619 | 3500 | 4382 | 5586 | 4903 | 6334 | 9126 | 790 |
+| avx2_unroll   | 18567 | 2940 | 3563 | 4622 | 3907 | 5138 | 7794 | 797 |
+| avx2_unrollx2 | 19619 | 3500 | 4382 | 5586 | 4903 | 6334 | 9126 | 790 |
+
 ### Compress
 
 | algo | single line | 1-20 | 5-20 | 10-30 | 0-40 | 0-80 | 40-120 | all lines |
@@ -81,7 +82,8 @@ The `sse2_unrollx4` variants perform very well and are probably the easiest to i
 | sse2 unroll   | 14906 | 2667 | 3588 | 4506 | 3421 | 4595 | 6850 | 1570 |
 | sse2 unrollx4 | 16704 | 4567 | 5500 | 6760 | 5554 | 6599 | 9040 | 1687 |
 | avx2 unroll   | 18956 | 3428 | 4319 | 5302 | 4475 | 5672 | 8152 | 1745 |
-| avx2unrollx2  | 19158 | 4508 | 5223 | 6581 | 5430 | 6260 | 8793 | 1799 |
+| avx2 unrollx2 | 19158 | 4508 | 5223 | 6581 | 5430 | 6260 | 8793 | 1799 |
+
 ## CPU w/ AVX512
 
 ### Slice
