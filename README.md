@@ -1,5 +1,7 @@
 An informal benchmark for splitting a string on newlines. While this is a rather boring problem, the ideas can be applied to other algorithms, especially parsing.
 
+[skip to benchmark results](#my-results)
+
 ## Notes
 If you want to write a _really_ fast parser, you almost certainly don't want to split on newlines and then iterate over the lines.
 You'd be reading bytes twice. Instead, you'd write your parsing logic as "repeat this until newline".
@@ -11,7 +13,7 @@ Of course, keep in mind the actual input sizes and optimize where it's worthwhil
 * Instead of storing slices, store the positions of newlines - it's the same information, but significantly less space. More generally, consider the redundancy between elements, and whether you can compress them somehow.
 * Even just `sse2`, which is standard on `x86-64`, helps to greatly accelerate basic string operations.
 * Bounds checks can significantly pessimize this type of code - be sure to skim the assembly of your inner loops for unexpected branches.
-* Be careful when using collections with vector code - `Vec::push` compiles to a function call, which means your vector registers have to be reloaded. This *really* hurts in more complicated algorithms. Generally, if you're writing a tight SIMD loop, check the ASM to see where the compiler is inserting loads for constants. If it's happening every iteration of the inner loop, something's wrong and it's probably a function call.
+* Be careful when using collections with SIMD code - `Vec::push` compiles to a function call, which means your vector registers have to be reloaded. This *really* hurts in more complicated algorithms. Generally, if you're writing a tight SIMD loop, check the ASM to see where the compiler is inserting loads for constants. If it's happening every iteration of the inner loop, something's wrong and it's probably a function call.
 * `vpcompressb` is still the greatest thing since sliced bread. (seen in the AVX512 algo)
 
 The `LineIndex` data structure stores newline positions in a compressed form. 2 bytes per newline, and 8 bytes per 64KB of input. For comparison, a string slice in a 64 bit Rust program takes 16 bytes.
@@ -52,51 +54,59 @@ unsafe {
 
 Throughput in MB/s of input. AVX512 results are on the very last line.
 
+## TL;DR
+The `sse2_unrollx4` variants perform very well and are probably the easiest to integrate (runs on any x86-64 CPU).
+
 ## 9th gen Intel
 
 ### Slice
 
-| algo | single line | 1-20 | 5-20 | 10-30 | 40-50 | all lines |
-| :-- | --: | --: | --: | --: | --: | --: |
-| std         | 11875 |  331 |  377 |  547 | 1108 |  61 |
-| std_reuse   | 12004 |  542 |  628 |  893 | 1944 | 173 |
-| sse2        |  9658 | 1941 | 2535 | 2992 | 5487 | 473 |
-| sse2_unsafe |  9653 | 2243 | 2778 | 3209 | 5882 | 675 | 
-| sse2_unroll | 11129 | 2116 | 2759 | 3452 | 5919 | 767 |
-| avx2        | 14857 | 2019 | 2409 | 3177 | 6106 | 323 |
-| avx2_unsafe | 14798 | 2794 | 3277 | 3985 | 7453 | 622 |
-| avx2_unroll | 18634 | 2725 | 3351 | 4423 | 7273 | 731 |
-
+| algo | single line | 1-20 | 5-20 | 10-30 | 0-40 | 0-80 | 40-120 | all lines |
+| :-- | --: | --: | --: | --: | --: | --: | --: | --: |
+| std_reuse     | 12384 | 604  | 696  | 961  | 945  | 1518 | 2719 | 209 |
+| sse2          | 9634  | 2050 | 2588 | 3025 | 2538 | 3299 | 4596 | 490 |
+| sse2_unsafe   | 9964  | 2237 | 2854 | 3396 | 2659 | 3384 | 4626 | 705 |
+| sse2_unroll   | 11201 | 2192 | 2889 | 3454 | 2738 | 3701 | 5334 | 780 |
+| sse2_unrollx4 | 17145 | 3855 | 4656 | 5987 | 4913 | 6191 | 9010 | 791 |
+| avx2          | 14854 | 2051 | 2477 | 3411 | 3033 | 3873 | 5683 | 309 |
+| avx2_unsafe   | 14854 | 2786 | 3278 | 4266 | 3615 | 4321 | 6088 | 635 |
+| avx2_unrollx2 | 18567 | 2940 | 3563 | 4622 | 3907 | 5138 | 7794 | 797 |
+| avx2_unroll   | 19619 | 3500 | 4382 | 5586 | 4903 | 6334 | 9126 | 790 |
 ### Compress
 
-| algo | single line | 1-20 | 5-20 | 10-30 | 40-50 | all lines |
-| :-- | --: | --: | --: | --: | --: | --: |
-| iter        |  2055 |  878 | 1259 | 1259 |  1621 |  537 |
-| sse2        | 11092 | 2522 | 3122 | 4090 |  7636 | 1305 |
-| sse2 unroll | 14743 | 2594 | 3279 | 4207 |  7753 | 1543 |
-| avx2 unroll | 18709 | 3380 | 4396 | 5359 | 10692 | 1801 |
-
+| algo | single line | 1-20 | 5-20 | 10-30 | 0-40 | 0-80 | 40-120 | all lines |
+| :-- | --: | --: | --: | --: | --: | --: | --: | --: |
+| iter          | 2075  | 875  | 1034 | 1278 | 1281 | 1563 | 1802 | 621  |
+| sse2          | 11448 | 2636 | 3423 | 4255 | 3243 | 4471 | 6562 | 1310 |
+| sse2 unroll   | 14906 | 2667 | 3588 | 4506 | 3421 | 4595 | 6850 | 1570 |
+| sse2 unrollx4 | 16704 | 4567 | 5500 | 6760 | 5554 | 6599 | 9040 | 1687 |
+| avx2 unroll   | 18956 | 3428 | 4319 | 5302 | 4475 | 5672 | 8152 | 1745 |
+| avx2unrollx2  | 19158 | 4508 | 5223 | 6581 | 5430 | 6260 | 8793 | 1799 |
 ## CPU w/ AVX512
 
 ### Slice
 
-| algo | single line | 1-20 | 5-20 | 10-30 | 40-50 | all lines |
-| :-- | --: | --: | --: | --: | --: | --: |
-| std         | 22119 |  731 |  826 | 1129 |  2517 |  152 |
-| std_reuse   | 21988 |  794 |  900 | 1248 |  2956 |  180 |
-| sse2        | 23833 | 3055 | 4099 | 5031 | 10837 |  698 |
-| sse2_unsafe | 23658 | 3391 | 4532 | 5475 | 11147 | 1189 |
-| sse2_unroll | 29178 | 3708 | 4992 | 6179 | 13575 | 1186 |
-| avx2        | 36360 | 4029 | 4915 | 6708 | 13425 |  741 |
-| avx2_unsafe | 36895 | 4657 | 5640 | 7561 | 14752 | 1232 |
-| avx2_unroll | 50930 | 4662 | 5850 | 8031 | 18306 | 1145 |
+| algo | single line | 1-20 | 5-20 | 10-30 | 0-40 | 0-80 | 40-120 | all lines |
+| :-- | --: | --: | --: | --: | --: | --: | --: | --: |
+| std           | 22031 |  723 |  836 |  1166 | 1172 |  2054 |  3647 |  147 |
+| std_reuse     | 21967 | 1064 | 1180 |  1583 | 1587 |  2692 |  4681 |  367 |
+| sse2          | 23739 | 3010 | 3961 |  4833 | 3814 |  5393 |  8510 |  821 |
+| sse2_unsafe   | 23635 | 3330 | 4447 |  5400 | 4089 |  5511 |  8684 | 1169 |
+| sse2_unroll   | 29939 | 3792 | 5151 |  6379 | 4716 |  6826 | 10952 | 1176 |
+| sse2_unrollx4 | 40701 | 6792 | 8338 | 11082 | 9100 | 11545 | 16059 | 1410 |
+| avx2          | 36927 | 4068 | 5019 |  6880 | 5755 |  7307 | 11653 |  745 |
+| avx2_unsafe   | 36845 | 4627 | 5638 |  7476 | 6165 |  7608 | 12037 | 1216 |
+| avx2_unroll   | 53034 | 4773 | 6075 |  8258 | 6742 |  8782 | 14128 | 1223 |
+| avx2_unrollx2 | 52315 | 7006 | 8571 | 11637 | 9463 | 12345 | 19387 | 1399 |
 
 ### Compress
 
-| algo | single line | 1-20 | 5-20 | 10-30 | 40-50 | all lines |
-| :-- | --: | --: | --: | --: | --: | --: |
-| iter        |  3874 |  1344 |  1725 |  2218 |  3210 |  1371 |
-| sse2        | 37064 |  3674 |  5052 |  6494 | 14724 |  2154 |
-| sse2 unroll | 33591 |  3881 |  5440 |  6446 | 15919 |  2339 |
-| avx2 unroll | 52322 |  5452 |  6902 |  8675 | 21244 |  3154 |
-| avx512      | 50391 | 32130 | 32708 | 37786 | 36360 | 11503 |
+| algo | single line | 1-20 | 5-20 | 10-30 | 0-40 | 0-80 | 40-120 | all lines |
+| :-- | --: | --: | --: | --: | --: | --: | --: | --: |
+| iter          |  5374 |  1234 |  1374 |  1674 |  1685 |  2098 |  2564 |  1397 |
+| sse2          | 35827 |  3720 |  5142 |  6455 |  4695 |  6713 | 11206 |  2083 |
+| sse2 unroll   | 33535 |  3889 |  5454 |  6529 |  4852 |  6874 | 10773 |  2307 |
+| sse2 unrollx4 | 42100 |  6866 |  8645 | 11524 |  8795 | 12066 | 17754 |  1950 |
+| avx2 unroll   | 49541 |  5639 |  7179 |  9124 |  7472 |  9202 | 14216 |  3160 |
+| avx2 unrollx2 | 50083 |  7916 |  9988 | 13206 |  9961 | 12613 | 19919 |  2667 |
+| avx512        | 53305 | 32729 | 34333 | 38183 | 36737 | 33878 | 19124 | 12447 |
