@@ -59,13 +59,11 @@ mod slice {
                 if input.as_bytes()[i] != b'\n' {
                     continue;
                 }
-                debug_assert!(line_start <= i);
                 out.push(unsafe { input.get_unchecked(line_start..i) });
                 line_start = i + 1;
             }
             // handle last line. omit if empty
             if line_start != input.len() {
-                debug_assert!(line_start <= input.len());
                 out.push(unsafe { input.get_unchecked(line_start..) });
             }
         }
@@ -81,7 +79,6 @@ mod slice {
                     while mask != 0 {
                         let bit_pos = mask.trailing_zeros() as usize;
                         let line_end = chunk_i * 16 + bit_pos;
-                        debug_assert!(line_start <= line_end);
                         out.push(input.get_unchecked(line_start..line_end));
                         line_start = line_end + 1;
                         mask &= mask - 1;
@@ -101,15 +98,14 @@ mod slice {
                 let stop_chunk_i = input.len() / 16;
                 while chunk_i < stop_chunk_i {
                     let mut write_i = 0;
-                    out.reserve(64);
-                    let out_arr = out.spare_capacity_mut().get_unchecked_mut(..64);
-                    while write_i < (64 - 16) && chunk_i < stop_chunk_i {
+                    out.reserve(256);
+                    let out_arr = out.spare_capacity_mut().get_unchecked_mut(..256);
+                    while write_i < (256 - 16) && chunk_i < stop_chunk_i {
                         let v = _mm_loadu_si128(input.as_ptr().byte_add(chunk_i * 16).cast());
                         let mut mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, nl_v)) as u16;
                         while mask != 0 {
                             let bit_pos = mask.trailing_zeros() as usize;
                             let line_end = chunk_i * 16 + bit_pos;
-                            debug_assert!(line_start <= line_end);
                             out_arr
                                 .get_unchecked_mut(write_i)
                                 .write(input.get_unchecked(line_start..line_end));
@@ -123,6 +119,45 @@ mod slice {
                 }
             }
             tail(line_start, 16, input, out);
+        }
+
+        pub fn sse2_unrollx4<'input>(input: &'input str, out: &mut Vec<&'input str>) {
+            let mut line_start = 0;
+            unsafe {
+                let nl_v = _mm_loadu_si128([b'\n'; 16].as_ptr().cast());
+                let mut chunk_i = 0;
+                let stop_chunk_i = input.len() / 64;
+                while chunk_i < stop_chunk_i {
+                    let mut write_i = 0;
+                    out.reserve(256);
+                    let out_arr = out.spare_capacity_mut().get_unchecked_mut(..256);
+                    while write_i < (256 - 64) && chunk_i < stop_chunk_i {
+                        use std::arch::x86_64::{
+                            _mm_cmpeq_epi8 as eq, _mm_loadu_si128 as load,
+                            _mm_movemask_epi8 as movemask,
+                        };
+                        let in_ptr = input.as_ptr().byte_add(chunk_i * 64).cast::<__m128i>();
+                        let mask0 = movemask(eq(load(in_ptr), nl_v)) as u64;
+                        let mask1 = movemask(eq(load(in_ptr.byte_add(16)), nl_v)) as u64;
+                        let mask2 = movemask(eq(load(in_ptr.byte_add(32)), nl_v)) as u64;
+                        let mask3 = movemask(eq(load(in_ptr.byte_add(48)), nl_v)) as u64;
+                        let mut mask = mask0 | (mask1 << 16) | (mask2 << 32) | (mask3 << 48);
+                        while mask != 0 {
+                            let bit_pos = mask.trailing_zeros() as usize;
+                            let line_end = chunk_i * 64 + bit_pos;
+                            out_arr
+                                .get_unchecked_mut(write_i)
+                                .write(input.get_unchecked(line_start..line_end));
+                            write_i += 1;
+                            line_start = line_end + 1;
+                            mask &= mask - 1;
+                        }
+                        chunk_i += 1;
+                    }
+                    out.set_len(out.len() + write_i);
+                }
+            }
+            tail(line_start, 64, input, out);
         }
 
         pub fn can_run_avx2() -> bool {
@@ -140,7 +175,6 @@ mod slice {
                 while mask != 0 {
                     let bit_pos = mask.trailing_zeros() as usize;
                     let line_end = chunk_i * 32 + bit_pos;
-                    debug_assert!(line_start <= line_end);
                     out.push(&input[line_start..line_end]);
                     line_start = line_end + 1;
                     mask &= mask - 1;
@@ -180,16 +214,15 @@ mod slice {
                 // this is the only function call in the loop. Vector registers have to be reloaded
                 // after a function call. That's why we go through the trouble of removing it from the
                 // inner loop.
-                out.reserve(64);
-                let out_arr = out.spare_capacity_mut().get_unchecked_mut(..64);
+                out.reserve(256);
+                let out_arr = out.spare_capacity_mut().get_unchecked_mut(..256);
                 // at most 32 items will be added per chunk
-                while write_i <= (64 - 32) && chunk_i < stop_chunk_i {
+                while write_i <= (256 - 32) && chunk_i < stop_chunk_i {
                     let v = _mm256_loadu_si256(input.as_ptr().byte_add(chunk_i * 32).cast());
                     let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl_v)) as u32;
                     while mask != 0 {
                         let bit_pos = mask.trailing_zeros() as usize;
                         let line_end = chunk_i * 32 + bit_pos;
-                        debug_assert!(line_start <= line_end);
                         out_arr
                             .get_unchecked_mut(write_i)
                             .write(input.get_unchecked(line_start..line_end));
@@ -202,6 +235,47 @@ mod slice {
                 out.set_len(out.len() + write_i);
             }
             tail(line_start, 32, input, out);
+        }
+
+        #[target_feature(enable = "avx2")]
+        pub unsafe fn avx2_unrollx2<'input>(input: &'input str, out: &mut Vec<&'input str>) {
+            use std::arch::x86_64::{
+                _mm256_cmpeq_epi8 as eq, _mm256_loadu_si256 as load,
+                _mm256_movemask_epi8 as movemask,
+            };
+            let mut line_start = 0;
+            let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
+            let mut chunk_i = 0;
+            let stop_chunk_i = input.len() / 64;
+            while chunk_i < stop_chunk_i {
+                let mut write_i = 0;
+                // this is the only function call in the loop. Vector registers have to be reloaded
+                // after a function call. That's why we go through the trouble of removing it from the
+                // inner loop.
+                out.reserve(256);
+                let out_arr = out.spare_capacity_mut().get_unchecked_mut(..256);
+                // at most 64 items will be added per chunk
+                while write_i <= (256 - 64) && chunk_i < stop_chunk_i {
+                    let ptr = input.as_ptr().byte_add(chunk_i * 64);
+                    let v1 = load(ptr.cast());
+                    let v2 = load(ptr.byte_add(32).cast());
+                    let mut mask = ((movemask(eq(v2, nl_v)) as u32 as u64) << 32)
+                        | (movemask(eq(v1, nl_v)) as u32 as u64);
+                    while mask != 0 {
+                        let bit_pos = mask.trailing_zeros() as usize;
+                        let line_end = chunk_i * 64 + bit_pos;
+                        out_arr
+                            .get_unchecked_mut(write_i)
+                            .write(input.get_unchecked(line_start..line_end));
+                        write_i += 1;
+                        line_start = line_end + 1;
+                        mask &= mask - 1;
+                    }
+                    chunk_i += 1;
+                }
+                out.set_len(out.len() + write_i);
+            }
+            tail(line_start, 64, input, out);
         }
     }
 }
@@ -242,7 +316,6 @@ mod compressed {
         use crate::compressed::*;
         use std::arch::x86_64::*;
 
-        #[no_mangle]
         pub fn sse2(input: &str, out: &mut LineIndex) {
             let nl_v = unsafe { _mm_loadu_si128([b'\n'; 16].as_ptr().cast()) };
             for chunk_64k in input.as_bytes().chunks(1 << 16) {
@@ -262,7 +335,6 @@ mod compressed {
             tail(16, input, out);
         }
 
-        #[no_mangle]
         pub fn sse2_unroll(input: &str, out: &mut LineIndex) {
             let nl_v = unsafe { _mm_loadu_si128([b'\n'; 16].as_ptr().cast()) };
             for chunk_64k in input.as_bytes().chunks(1 << 16) {
@@ -294,12 +366,50 @@ mod compressed {
             tail(16, input, out);
         }
 
+        pub fn sse2_unrollx4(input: &str, out: &mut LineIndex) {
+            use std::arch::x86_64::{
+                _mm_cmpeq_epi8 as eq, _mm_loadu_si128 as load, _mm_movemask_epi8 as movemask,
+            };
+            let nl_v = unsafe { load([b'\n'; 16].as_ptr().cast()) };
+            for chunk_64k in input.as_bytes().chunks(1 << 16) {
+                out.high_starts.push(out.lows.len());
+                let mut chunk_i = 0;
+                let stop_chunk_i = chunk_64k.len() / 64;
+                while chunk_i < stop_chunk_i {
+                    let mut write_i = 0;
+                    out.lows.reserve(256);
+                    unsafe {
+                        let out_arr = out.lows.spare_capacity_mut().get_unchecked_mut(..256);
+                        while write_i <= (256 - 64) && chunk_i < stop_chunk_i {
+                            let in_ptr =
+                                chunk_64k.as_ptr().byte_add(chunk_i * 64).cast::<__m128i>();
+                            let mask0 = movemask(eq(load(in_ptr), nl_v)) as u64;
+                            let mask1 = movemask(eq(load(in_ptr.byte_add(16)), nl_v)) as u64;
+                            let mask2 = movemask(eq(load(in_ptr.byte_add(32)), nl_v)) as u64;
+                            let mask3 = movemask(eq(load(in_ptr.byte_add(48)), nl_v)) as u64;
+                            let mut mask = mask0 | (mask1 << 16) | (mask2 << 32) | (mask3 << 48);
+                            while mask != 0 {
+                                let bit_pos = mask.trailing_zeros() as u16;
+                                out_arr
+                                    .get_unchecked_mut(write_i)
+                                    .write(chunk_i as u16 * 64 + bit_pos);
+                                write_i += 1;
+                                mask &= mask - 1;
+                            }
+                            chunk_i += 1;
+                        }
+                        out.lows.set_len(out.lows.len() + write_i);
+                    }
+                }
+            }
+            tail(64, input, out);
+        }
+
         pub fn can_run_avx2() -> bool {
             is_x86_feature_detected!("avx2")
         }
 
         #[target_feature(enable = "avx2,bmi1")]
-        #[no_mangle]
         pub unsafe fn avx2_unroll(input: &str, out: &mut LineIndex) {
             let nl_v = unsafe { _mm256_loadu_si256([b'\n'; 32].as_ptr().cast()) };
             for chunk_64k in input.as_bytes().chunks(1 << 16) {
@@ -327,6 +437,43 @@ mod compressed {
                 }
             }
             tail(32, input, out);
+        }
+
+        #[target_feature(enable = "avx2,bmi1")]
+        pub unsafe fn avx2_unrollx2(input: &str, out: &mut LineIndex) {
+            use std::arch::x86_64::{
+                _mm256_cmpeq_epi8 as eq, _mm256_loadu_si256 as load,
+                _mm256_movemask_epi8 as movemask,
+            };
+            let nl_v = unsafe { _mm256_loadu_si256([b'\n'; 32].as_ptr().cast()) };
+            for chunk_64k in input.as_bytes().chunks(1 << 16) {
+                out.high_starts.push(out.lows.len());
+                let mut chunk_i = 0;
+                let stop_chunk_i = chunk_64k.len() / 64;
+                while chunk_i < stop_chunk_i {
+                    let mut write_i = 0;
+                    out.lows.reserve(256);
+                    let out_arr = out.lows.spare_capacity_mut().get_unchecked_mut(..256);
+                    while write_i <= (256 - 64) && chunk_i < stop_chunk_i {
+                        let ptr = chunk_64k.as_ptr().add(chunk_i * 64);
+                        let v1 = load(ptr.cast());
+                        let v2 = load(ptr.byte_add(32).cast());
+                        let mut mask = ((movemask(eq(v2, nl_v)) as u32 as u64) << 32)
+                            | (movemask(eq(v1, nl_v)) as u32 as u64);
+                        while mask != 0 {
+                            let bit_pos = mask.trailing_zeros() as u16;
+                            out_arr
+                                .get_unchecked_mut(write_i)
+                                .write(chunk_i as u16 * 64 + bit_pos);
+                            write_i += 1;
+                            mask &= mask - 1;
+                        }
+                        chunk_i += 1;
+                    }
+                    out.lows.set_len(out.lows.len() + write_i);
+                }
+            }
+            tail(64, input, out);
         }
 
         #[cfg(feature = "nightly")]
@@ -411,8 +558,7 @@ fn prep_vec_range<const M: usize, const N: usize>(vec: &mut Vec<u8>) -> usize {
     assert!(M <= N);
     vec.fill(b'a');
     let mut idx = 0;
-    // TODO: better heuristic for length cap
-    (0..vec.len().min(64 * 1024 * 1024) * 2 / (N + M))
+    (0..vec.len().min(256 * 1024 * 1024) * 2 / (N + M))
         .collect::<HashSet<usize>>()
         .iter()
         .copied()
@@ -421,7 +567,7 @@ fn prep_vec_range<const M: usize, const N: usize>(vec: &mut Vec<u8>) -> usize {
             idx += i;
             vec[idx] = b'\n';
         });
-    vec.len().min(64 * 1024 * 1024)
+    vec.len().min(256 * 1024 * 1024)
 }
 
 type SliceSplitFn = for<'a, 'b> fn(&'a str, &'b mut Vec<&'a str>);
@@ -437,7 +583,9 @@ fn main() {
         ("1-20 byte lines", prep_vec_range::<1, 20>),
         ("5-20 byte lines", prep_vec_range::<5, 20>),
         ("10-30 byte lines", prep_vec_range::<10, 30>),
-        ("40-50 byte lines", prep_vec_range::<40, 50>),
+        ("0-40 byte lines", prep_vec_range::<0, 40>),
+        ("0-80 byte lines", prep_vec_range::<0, 80>),
+        ("40-120 byte lines", prep_vec_range::<40, 120>),
         ("all lines", |vec| {
             vec.fill(b'\n');
             // You might OOM w/ 1 billion
@@ -453,6 +601,8 @@ fn main() {
         #[cfg(target_arch = "x86_64")]
         ("sse2_unroll", || true, slice::x86_64::sse2_unroll),
         #[cfg(target_arch = "x86_64")]
+        ("sse2_unrollx4", || true, slice::x86_64::sse2_unrollx4),
+        #[cfg(target_arch = "x86_64")]
         ("avx2", slice::x86_64::can_run_avx2, |a, b| unsafe {
             slice::x86_64::avx2(a, b)
         }),
@@ -464,6 +614,12 @@ fn main() {
         ("avx2_unroll", slice::x86_64::can_run_avx2, |a, b| unsafe {
             slice::x86_64::avx2_unroll(a, b)
         }),
+        #[cfg(target_arch = "x86_64")]
+        (
+            "avx2_unrollx2",
+            slice::x86_64::can_run_avx2,
+            |a, b| unsafe { slice::x86_64::avx2_unrollx2(a, b) },
+        ),
     ];
     let compressed_bench_cases: &[(&str, FeatCheckFn, CompressSplitFn)] = &[
         ("iter", || true, compressed::iter),
@@ -472,10 +628,18 @@ fn main() {
         #[cfg(target_arch = "x86_64")]
         ("sse2 unroll", || true, compressed::x86_64::sse2_unroll),
         #[cfg(target_arch = "x86_64")]
+        ("sse2 unrollx4", || true, compressed::x86_64::sse2_unrollx4),
+        #[cfg(target_arch = "x86_64")]
         (
             "avx2 unroll",
             compressed::x86_64::can_run_avx2,
             |a, b| unsafe { compressed::x86_64::avx2_unroll(a, b) },
+        ),
+        #[cfg(target_arch = "x86_64")]
+        (
+            "avx2 unrollx2",
+            compressed::x86_64::can_run_avx2,
+            |a, b| unsafe { compressed::x86_64::avx2_unrollx2(a, b) },
         ),
         #[cfg(all(feature = "nightly", target_arch = "x86_64"))]
         (
@@ -552,8 +716,8 @@ fn main() {
             black_box(&mut out_compressed_buf);
             let thrpt = len as f64 / duration / 1_000_000.;
             println!("{fn_label:<13}: {thrpt:>8.0}");
-            debug_assert_eq!(out_compressed_buf.lows, test_compressed_buf.lows);
-            debug_assert_eq!(
+            assert_eq!(out_compressed_buf.lows, test_compressed_buf.lows);
+            assert_eq!(
                 out_compressed_buf.high_starts,
                 test_compressed_buf.high_starts
             );
@@ -632,6 +796,17 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn test_sse2_unrollx4() {
+        let mut buf = Vec::new();
+        for (input, expected) in TEST_CASES {
+            buf.clear();
+            x86_64::sse2_unrollx4(input, &mut buf);
+            assert_eq!(expected, &buf, "input: `{input}`");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn test_avx2() {
         if !x86_64::can_run_avx2() {
             return;
@@ -654,6 +829,19 @@ mod tests {
         for (input, expected) in TEST_CASES {
             buf.clear();
             unsafe { x86_64::avx2_unroll(input, &mut buf) };
+            assert_eq!(expected, &buf, "input: `{input}`");
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx2_unrollx2() {
+        if !x86_64::can_run_avx2() {
+            return;
+        }
+        let mut buf = Vec::new();
+        for (input, expected) in TEST_CASES {
+            buf.clear();
+            unsafe { x86_64::avx2_unrollx2(input, &mut buf) };
             assert_eq!(expected, &buf, "input: `{input}`");
         }
     }
