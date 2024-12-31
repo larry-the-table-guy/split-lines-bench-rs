@@ -406,6 +406,55 @@ mod compressed {
             tail(64, input, out);
         }
 
+        pub fn sse2_unrollx4_ya(input: &str, out: &mut LineIndex) {
+            use std::arch::x86_64::{
+                _mm_cmpeq_epi8 as eq, _mm_loadu_si128 as load, _mm_movemask_epi8 as movemask,
+            };
+            let nl_v = unsafe { load([b'\n'; 16].as_ptr().cast()) };
+            for chunk_64k in input.as_bytes().chunks(1 << 16) {
+                out.high_starts.push(out.lows.len());
+                let mut chunk_i = 0;
+                let stop_chunk_i = chunk_64k.len() / 64;
+                while chunk_i < stop_chunk_i {
+                    let mut write_i = 0;
+                    out.lows.reserve(256);
+                    unsafe {
+                        let out_arr = out.lows.spare_capacity_mut().get_unchecked_mut(..256);
+                        while write_i <= (256 - 64) && chunk_i < stop_chunk_i {
+                            let in_ptr =
+                                chunk_64k.as_ptr().byte_add(chunk_i * 64).cast::<__m128i>();
+                            let mask0 = movemask(eq(load(in_ptr), nl_v)) as u64;
+                            let mask1 = movemask(eq(load(in_ptr.byte_add(16)), nl_v)) as u64;
+                            let mask2 = movemask(eq(load(in_ptr.byte_add(32)), nl_v)) as u64;
+                            let mask3 = movemask(eq(load(in_ptr.byte_add(48)), nl_v)) as u64;
+                            let mut mask = mask0 | (mask1 << 16) | (mask2 << 32) | (mask3 << 48);
+                            let mut was_odd = false;
+                            while mask != 0 {
+                                let bit_pos = mask.trailing_zeros() as u16;
+                                out_arr
+                                    .get_unchecked_mut(write_i)
+                                    .write(chunk_i as u16 * 64 + bit_pos);
+                                //write_i += 1;
+                                mask &= mask - 1;
+
+                                let bit_pos = mask.trailing_zeros() as u16;
+                                out_arr
+                                    .get_unchecked_mut(write_i + 1)
+                                    .write(chunk_i as u16 * 64 + bit_pos);
+                                write_i += 2;
+                                was_odd = mask == 0;
+                                mask &= mask - 1;
+                            }
+                            write_i -= was_odd as usize;
+                            chunk_i += 1;
+                        }
+                        out.lows.set_len(out.lows.len() + write_i);
+                    }
+                }
+            }
+            tail(64, input, out);
+        }
+
         pub fn can_run_avx2() -> bool {
             is_x86_feature_detected!("avx2")
         }
@@ -469,6 +518,52 @@ mod compressed {
                             write_i += 1;
                             mask &= mask - 1;
                         }
+                        chunk_i += 1;
+                    }
+                    out.lows.set_len(out.lows.len() + write_i);
+                }
+            }
+            tail(64, input, out);
+        }
+
+        #[target_feature(enable = "avx2,bmi1")]
+        pub unsafe fn avx2_unrollx2_ya(input: &str, out: &mut LineIndex) {
+            use std::arch::x86_64::{
+                _mm256_cmpeq_epi8 as eq, _mm256_loadu_si256 as load,
+                _mm256_movemask_epi8 as movemask,
+            };
+            let nl_v = unsafe { _mm256_loadu_si256([b'\n'; 32].as_ptr().cast()) };
+            for chunk_64k in input.as_bytes().chunks(1 << 16) {
+                out.high_starts.push(out.lows.len());
+                let mut chunk_i = 0;
+                let stop_chunk_i = chunk_64k.len() / 64;
+                while chunk_i < stop_chunk_i {
+                    let mut write_i = 0;
+                    out.lows.reserve(256);
+                    let out_arr = out.lows.spare_capacity_mut().get_unchecked_mut(..256);
+                    while write_i <= (256 - 64) && chunk_i < stop_chunk_i {
+                        let ptr = chunk_64k.as_ptr().add(chunk_i * 64);
+                        let v1 = load(ptr.cast());
+                        let v2 = load(ptr.byte_add(32).cast());
+                        let mut mask = ((movemask(eq(v2, nl_v)) as u32 as u64) << 32)
+                            | (movemask(eq(v1, nl_v)) as u32 as u64);
+                        let mut was_odd = false;
+                        while mask != 0 {
+                            let bit_pos = mask.trailing_zeros() as u16;
+                            out_arr
+                                .get_unchecked_mut(write_i)
+                                .write(chunk_i as u16 * 64 + bit_pos);
+                            mask &= mask - 1;
+
+                            let bit_pos = mask.trailing_zeros() as u16;
+                            out_arr
+                                .get_unchecked_mut(write_i + 1)
+                                .write(chunk_i as u16 * 64 + bit_pos);
+                            write_i += 2;
+                            was_odd = mask == 0;
+                            mask &= mask - 1;
+                        }
+                        write_i -= was_odd as usize;
                         chunk_i += 1;
                     }
                     out.lows.set_len(out.lows.len() + write_i);
@@ -629,6 +724,8 @@ fn main() {
         #[cfg(target_arch = "x86_64")]
         ("sse2 unrollx4", || true, compressed::x86_64::sse2_unrollx4),
         #[cfg(target_arch = "x86_64")]
+        ("sse2 unrollx4 ya", || true, compressed::x86_64::sse2_unrollx4_ya),
+        #[cfg(target_arch = "x86_64")]
         (
             "avx2 unroll",
             compressed::x86_64::can_run_avx2,
@@ -639,6 +736,12 @@ fn main() {
             "avx2 unrollx2",
             compressed::x86_64::can_run_avx2,
             |a, b| unsafe { compressed::x86_64::avx2_unrollx2(a, b) },
+        ),
+        #[cfg(target_arch = "x86_64")]
+        (
+            "avx2 unrollx2 ya",
+            compressed::x86_64::can_run_avx2,
+            |a, b| unsafe { compressed::x86_64::avx2_unrollx2_ya(a, b) },
         ),
         #[cfg(all(feature = "nightly", target_arch = "x86_64"))]
         (
