@@ -162,9 +162,11 @@ mod slice {
 
         pub fn can_run_avx2() -> bool {
             is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("bmi1")
+                && is_x86_feature_detected!("popcnt")
         }
 
-        #[target_feature(enable = "avx2")]
+        #[target_feature(enable = "avx2,bmi1,popcnt")]
         pub unsafe fn avx2<'input>(input: &'input str, out: &mut Vec<&'input str>) {
             // scan 32-byte chunks, then handle tail
             let mut line_start = 0;
@@ -183,7 +185,7 @@ mod slice {
             tail(line_start, 32, input, out);
         }
 
-        #[target_feature(enable = "avx2")]
+        #[target_feature(enable = "avx2,bmi1,popcnt")]
         pub unsafe fn avx2_unsafe<'input>(input: &'input str, out: &mut Vec<&'input str>) {
             // scan 32-byte chunks, then handle tail
             let mut line_start = 0;
@@ -202,7 +204,7 @@ mod slice {
             tail(line_start, 32, input, out);
         }
 
-        #[target_feature(enable = "avx2")]
+        #[target_feature(enable = "avx2,bmi1,popcnt")]
         pub unsafe fn avx2_unroll<'input>(input: &'input str, out: &mut Vec<&'input str>) {
             // Key idea is to pull the allocation out of the innermost loop
             let mut line_start = 0;
@@ -237,7 +239,7 @@ mod slice {
             tail(line_start, 32, input, out);
         }
 
-        #[target_feature(enable = "avx2")]
+        #[target_feature(enable = "avx2,bmi1,popcnt")]
         pub unsafe fn avx2_unrollx2<'input>(input: &'input str, out: &mut Vec<&'input str>) {
             use std::arch::x86_64::{
                 _mm256_cmpeq_epi8 as eq, _mm256_loadu_si256 as load,
@@ -407,10 +409,13 @@ mod compressed {
         }
 
         pub fn can_run_avx2() -> bool {
+            // in practice, avx2 also implies bmi1 and popcnt
             is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("bmi1")
+                && is_x86_feature_detected!("popcnt")
         }
 
-        #[target_feature(enable = "avx2,bmi1")]
+        #[target_feature(enable = "avx2,bmi1,popcnt")]
         pub unsafe fn avx2_unroll(input: &str, out: &mut LineIndex) {
             let nl_v = unsafe { _mm256_loadu_si256([b'\n'; 32].as_ptr().cast()) };
             for chunk_64k in input.as_bytes().chunks(1 << 16) {
@@ -440,7 +445,7 @@ mod compressed {
             tail(32, input, out);
         }
 
-        #[target_feature(enable = "avx2,bmi1")]
+        #[target_feature(enable = "avx2,bmi1,popcnt")]
         pub unsafe fn avx2_unrollx2(input: &str, out: &mut LineIndex) {
             use std::arch::x86_64::{
                 _mm256_cmpeq_epi8 as eq, _mm256_loadu_si256 as load,
