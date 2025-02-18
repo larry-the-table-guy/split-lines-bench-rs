@@ -408,6 +408,100 @@ mod compressed {
             tail(64, input, out);
         }
 
+        pub fn can_run_sse42() -> bool {
+            is_x86_feature_detected!("popcnt")
+        }
+
+        // enabling bmi1 isn't interesting bc there's a very narrow slice of CPUs with BMI1 but not
+        // AVX2, but a broad range of older CPUS with popcnt
+        #[target_feature(enable = "popcnt")]
+        pub unsafe fn sse42_unrollx4_interleavex2(input: &str, out: &mut LineIndex) {
+            use std::arch::x86_64::{
+                _mm_cmpeq_epi8 as eq, _mm_loadu_si128 as load, _mm_movemask_epi8 as movemask,
+            };
+            const CHUNK_SIZE: usize = 128;
+            /// count_ones() without branching on the zero case. Result undefined if input is 0
+            fn raw_tzcnt(input: u64) -> u64 {
+                let mut output;
+                unsafe {
+                    std::arch::asm!("tzcnt {output}, {input}", input = in(reg) input, output = out(reg) output)
+                };
+                output
+            }
+            let nl_v = unsafe { load([b'\n'; 16].as_ptr().cast()) };
+            for chunk_64k in input.as_bytes().chunks(1 << 16) {
+                out.high_starts.push(out.lows.len());
+                let mut chunk_i = 0;
+                let stop_chunk_i = chunk_64k.len() / CHUNK_SIZE;
+                while chunk_i < stop_chunk_i {
+                    let mut write_i = 0;
+                    let iter_count = 32.min(stop_chunk_i - chunk_i);
+                    out.lows.reserve(iter_count * CHUNK_SIZE);
+                    let out_arr = out
+                        .lows
+                        .spare_capacity_mut()
+                        .get_unchecked_mut(..iter_count * CHUNK_SIZE);
+                    for _ in 0..iter_count {
+                        let mut mask1 = {
+                            let in_ptr = chunk_64k
+                                .as_ptr()
+                                .byte_add(chunk_i * CHUNK_SIZE)
+                                .cast::<__m128i>();
+                            let mask0 = movemask(eq(load(in_ptr), nl_v)) as u64;
+                            let mask1 = movemask(eq(load(in_ptr.byte_add(16)), nl_v)) as u64;
+                            let mask2 = movemask(eq(load(in_ptr.byte_add(32)), nl_v)) as u64;
+                            let mask3 = movemask(eq(load(in_ptr.byte_add(48)), nl_v)) as u64;
+                            mask0 | (mask1 << 16) | (mask2 << 32) | (mask3 << 48)
+                        };
+
+                        let mut mask2 = {
+                            let in_ptr = chunk_64k
+                                .as_ptr()
+                                .byte_add(chunk_i * CHUNK_SIZE + 64)
+                                .cast::<__m128i>();
+                            let mask0 = movemask(eq(load(in_ptr), nl_v)) as u64;
+                            let mask1 = movemask(eq(load(in_ptr.byte_add(16)), nl_v)) as u64;
+                            let mask2 = movemask(eq(load(in_ptr.byte_add(32)), nl_v)) as u64;
+                            let mask3 = movemask(eq(load(in_ptr.byte_add(48)), nl_v)) as u64;
+                            mask0 | (mask1 << 16) | (mask2 << 32) | (mask3 << 48)
+                        };
+                        let mut write_i2 = write_i + mask1.count_ones() as usize;
+                        let mask2_count = mask2.count_ones() as usize;
+
+                        while mask1 != 0 {
+                            let bit_pos = mask1.trailing_zeros() as u16;
+                            out_arr
+                                .get_unchecked_mut(write_i)
+                                .write(chunk_i as u16 * CHUNK_SIZE as u16 + bit_pos);
+                            write_i += 1;
+                            mask1 &= mask1 - 1;
+
+                            let bit_pos = raw_tzcnt(mask2) as u16;
+                            out_arr.get_unchecked_mut(write_i2).write(
+                                (chunk_i as u16 * CHUNK_SIZE as u16)
+                                    .wrapping_add(64)
+                                    .wrapping_add(bit_pos),
+                            );
+                            write_i2 += 1;
+                            mask2 &= mask2.wrapping_sub(1);
+                        }
+                        write_i += mask2_count;
+                        while mask2 != 0 {
+                            let bit_pos = mask2.trailing_zeros() as u16;
+                            out_arr
+                                .get_unchecked_mut(write_i2)
+                                .write(chunk_i as u16 * CHUNK_SIZE as u16 + 64 + bit_pos);
+                            write_i2 += 1;
+                            mask2 &= mask2 - 1;
+                        }
+                        chunk_i += 1;
+                    }
+                    out.lows.set_len(out.lows.len() + write_i);
+                }
+            }
+            tail(128, input, out);
+        }
+
         pub fn can_run_avx2() -> bool {
             // in practice, avx2 also implies bmi1 and popcnt
             is_x86_feature_detected!("avx2")
@@ -480,6 +574,77 @@ mod compressed {
                 }
             }
             tail(64, input, out);
+        }
+
+        #[target_feature(enable = "avx2,bmi1,popcnt")]
+        pub unsafe fn avx2_unrollx2_interleavex2(input: &str, out: &mut LineIndex) {
+            use std::arch::x86_64::{
+                _mm256_cmpeq_epi8 as eq, _mm256_loadu_si256 as load,
+                _mm256_movemask_epi8 as movemask,
+            };
+            const CHUNK_SIZE: usize = 128;
+            let nl_v = unsafe { _mm256_loadu_si256([b'\n'; 32].as_ptr().cast()) };
+            for chunk_64k in input.as_bytes().chunks(1 << 16) {
+                out.high_starts.push(out.lows.len());
+                let mut chunk_i = 0;
+                let stop_chunk_i = chunk_64k.len() / CHUNK_SIZE;
+                while chunk_i < stop_chunk_i {
+                    // two iters of 64B, start 2nd at + popcount, stop when first exhausted,
+                    // finish 2nd
+                    let mut write_i = 0;
+                    let iter_count = 32.min(stop_chunk_i - chunk_i);
+                    out.lows.reserve(iter_count * CHUNK_SIZE);
+                    let out_arr = out
+                        .lows
+                        .spare_capacity_mut()
+                        .get_unchecked_mut(..iter_count * CHUNK_SIZE);
+                    for _ in 0..iter_count {
+                        let ptr = chunk_64k.as_ptr().add(chunk_i * CHUNK_SIZE);
+                        let v1 = load(ptr.cast());
+                        let v2 = load(ptr.byte_add(32).cast());
+                        let mut mask1 = ((movemask(eq(v2, nl_v)) as u32 as u64) << 32)
+                            | (movemask(eq(v1, nl_v)) as u32 as u64);
+
+                        let v1 = load(ptr.byte_add(64).cast());
+                        let v2 = load(ptr.byte_add(96).cast());
+                        let mut mask2 = ((movemask(eq(v2, nl_v)) as u32 as u64) << 32)
+                            | (movemask(eq(v1, nl_v)) as u32 as u64);
+                        let mut write_i2 = write_i + mask1.count_ones() as usize;
+                        let mask2_count = mask2.count_ones() as usize;
+                        while mask1 != 0 {
+                            let bit_pos = mask1.trailing_zeros() as u16;
+                            out_arr
+                                .get_unchecked_mut(write_i)
+                                .write(chunk_i as u16 * CHUNK_SIZE as u16 + bit_pos);
+                            write_i += 1;
+                            mask1 &= mask1 - 1;
+
+                            let bit_pos = _tzcnt_u64(mask2) as u16;
+                            // if this turns out to be a junk value, it will be ignored later (by
+                            // truncating the slice). So, overflowing is fine.
+                            out_arr.get_unchecked_mut(write_i2).write(
+                                (chunk_i as u16 * CHUNK_SIZE as u16)
+                                    .wrapping_add(64)
+                                    .wrapping_add(bit_pos),
+                            );
+                            write_i2 += 1;
+                            mask2 &= mask2.wrapping_sub(1);
+                        }
+                        write_i += mask2_count;
+                        while mask2 != 0 {
+                            let bit_pos = mask2.trailing_zeros() as u16;
+                            out_arr
+                                .get_unchecked_mut(write_i2)
+                                .write(chunk_i as u16 * CHUNK_SIZE as u16 + 64 + bit_pos);
+                            write_i2 += 1;
+                            mask2 &= mask2 - 1;
+                        }
+                        chunk_i += 1;
+                    }
+                    out.lows.set_len(out.lows.len() + write_i);
+                }
+            }
+            tail(128, input, out);
         }
 
         #[cfg(feature = "nightly")]
@@ -575,7 +740,7 @@ fn prep_vec_range<const M: usize, const N: usize>(vec: &mut Vec<u8>) -> usize {
 }
 
 type SliceSplitFn = for<'a, 'b> fn(&'a str, &'b mut Vec<&'a str>);
-type CompressSplitFn = fn(&str, &mut compressed::LineIndex);
+type CompressSplitFn = unsafe fn(&str, &mut compressed::LineIndex);
 type FeatCheckFn = fn() -> bool;
 
 fn main() {
@@ -635,21 +800,33 @@ fn main() {
         ("sse2 unrollx4", || true, compressed::x86_64::sse2_unrollx4),
         #[cfg(target_arch = "x86_64")]
         (
+            "sse4 intrlv",
+            compressed::x86_64::can_run_sse42,
+            compressed::x86_64::sse42_unrollx4_interleavex2,
+        ),
+        #[cfg(target_arch = "x86_64")]
+        (
             "avx2 unroll",
             compressed::x86_64::can_run_avx2,
-            |a, b| unsafe { compressed::x86_64::avx2_unroll(a, b) },
+            compressed::x86_64::avx2_unroll,
         ),
         #[cfg(target_arch = "x86_64")]
         (
             "avx2 unrollx2",
             compressed::x86_64::can_run_avx2,
-            |a, b| unsafe { compressed::x86_64::avx2_unrollx2(a, b) },
+            compressed::x86_64::avx2_unrollx2,
+        ),
+        #[cfg(target_arch = "x86_64")]
+        (
+            "avx2 intrlv",
+            compressed::x86_64::can_run_avx2,
+            compressed::x86_64::avx2_unrollx2_interleavex2,
         ),
         #[cfg(all(feature = "nightly", target_arch = "x86_64"))]
         (
             "avx512",
             compressed::x86_64::can_run_avx512_compress,
-            |a, b| unsafe { compressed::x86_64::avx512_compress(a, b) },
+            compressed::x86_64::avx512_compress,
         ),
     ];
 
@@ -715,7 +892,7 @@ fn main() {
             out_compressed_buf.lows.clear();
             out_compressed_buf.high_starts.clear();
             let start = Instant::now();
-            fnc(input, &mut out_compressed_buf);
+            unsafe { fnc(input, &mut out_compressed_buf) };
             let duration = start.elapsed().as_secs_f64();
             black_box(&mut out_compressed_buf);
             let thrpt = len as f64 / duration / 1_000_000.;
