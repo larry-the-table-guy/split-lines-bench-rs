@@ -421,10 +421,11 @@ mod compressed {
             };
             const CHUNK_SIZE: usize = 128;
             /// count_ones() without branching on the zero case. Result undefined if input is 0
-            fn raw_tzcnt(input: u64) -> u64 {
+            /// Same encoding as tzcnt.
+            fn rep_bsf(input: u64) -> u64 {
                 let mut output;
                 unsafe {
-                    std::arch::asm!("tzcnt {output}, {input}", input = in(reg) input, output = out(reg) output)
+                    std::arch::asm!("rep bsf {output}, {input}", input = in(reg) input, output = out(reg) output)
                 };
                 output
             }
@@ -476,7 +477,7 @@ mod compressed {
                             write_i += 1;
                             mask1 &= mask1 - 1;
 
-                            let bit_pos = raw_tzcnt(mask2) as u16;
+                            let bit_pos = rep_bsf(mask2) as u16;
                             out_arr.get_unchecked_mut(write_i2).write(
                                 (chunk_i as u16 * CHUNK_SIZE as u16)
                                     .wrapping_add(64)
