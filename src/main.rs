@@ -924,7 +924,7 @@ fn main() {
     // now, print the markdown tables
 
     // Headers
-    println!("\n## Slice");
+    println!("\n## Slice\n");
     let print_table_header = || {
         print!("| algo |");
         for (stage_label, ..) in benchmark_stages {
@@ -952,7 +952,7 @@ fn main() {
         println!();
     }
 
-    println!("\n## Compressed format");
+    println!("\n## Compressed format\n");
     print_table_header();
     for (idx, (algo_name, ..)) in compressed_bench_cases.iter().enumerate() {
         print!("| {algo_name} |");
