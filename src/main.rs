@@ -750,15 +750,15 @@ fn main() {
 
     let benchmark_stages: &[(&str, fn(&mut Vec<u8>) -> usize)] = &[
         ("single line", |vec| vec.len()),
-        ("1-20 byte lines", prep_vec_range::<1, 20>),
-        ("5-20 byte lines", prep_vec_range::<5, 20>),
-        ("10-30 byte lines", prep_vec_range::<10, 30>),
-        ("0-40 byte lines", prep_vec_range::<0, 40>),
-        ("0-80 byte lines", prep_vec_range::<0, 80>),
-        ("40-120 byte lines", prep_vec_range::<40, 120>),
-        ("all lines", |vec| {
+        ("1-20", prep_vec_range::<1, 20>),
+        ("5-20", prep_vec_range::<5, 20>),
+        ("10-30", prep_vec_range::<10, 30>),
+        ("0-40", prep_vec_range::<0, 40>),
+        ("0-80", prep_vec_range::<0, 80>),
+        ("40-120", prep_vec_range::<40, 120>),
+        ("0-0", |vec| {
             vec.fill(b'\n');
-            // You might OOM w/ 1 billion
+            // Slices takes 16GB w/ 1 billion
             vec.len().min(64 * 1024 * 1024)
         }),
     ];
@@ -831,6 +831,10 @@ fn main() {
         ),
     ];
 
+    // this can be done with Vecs, but this is fine
+    let mut slice_thrpts = Vec::new();
+    let mut compressed_thrpts = Vec::new();
+
     let mut b = vec![b'a'; 1024 * 1024 * 1024];
 
     // pre-fill the vec (beyond just reserving) so that the first fn doesn't pay for all the page
@@ -847,6 +851,9 @@ fn main() {
 
     for (stage_label, prep_fn) in benchmark_stages {
         println!("\n\t\t{stage_label}");
+        let mut cur_slice_thrpts = Vec::new();
+        let mut cur_compressed_thrpts = Vec::new();
+
         let len = prep_fn(&mut b);
         let input = std::str::from_utf8(&b[..len]).unwrap();
         let mut out_slice_buf = pool_out_slice_buf;
@@ -858,6 +865,7 @@ fn main() {
             let duration = start.elapsed().as_secs_f64();
             let thrpt = len as f64 / duration / 1_000_000.;
             println!("{fn_label:<13}: {thrpt:>8.0}", fn_label = "std");
+            cur_slice_thrpts.push(thrpt);
         }
         for (fn_label, feat_checker, fnc) in slice_bench_cases {
             if !feat_checker() {
@@ -871,6 +879,7 @@ fn main() {
             black_box(&mut out_slice_buf);
             let thrpt = len as f64 / duration / 1_000_000.;
             println!("{fn_label:<13}: {thrpt:>8.0}");
+            cur_slice_thrpts.push(thrpt);
         }
         // run first test case again to show that it's not sensitive to order (e.g. cache)
         {
@@ -879,6 +888,7 @@ fn main() {
             let duration = start.elapsed().as_secs_f64();
             let thrpt = len as f64 / duration / 1_000_000.;
             println!("{fn_label:<13}: {thrpt:>8.0}", fn_label = "std");
+            cur_slice_thrpts.push(thrpt);
         }
 
         println!("\tcompressed");
@@ -898,6 +908,7 @@ fn main() {
             black_box(&mut out_compressed_buf);
             let thrpt = len as f64 / duration / 1_000_000.;
             println!("{fn_label:<13}: {thrpt:>8.0}");
+            cur_compressed_thrpts.push(thrpt);
             assert!(
                 out_compressed_buf == test_compressed_buf,
                 "(compressed) {fn_label} failed during {stage_label}"
@@ -905,6 +916,50 @@ fn main() {
         }
 
         pool_out_slice_buf = reset_vector(out_slice_buf);
+
+        slice_thrpts.push(cur_slice_thrpts);
+        compressed_thrpts.push(cur_compressed_thrpts);
+    }
+
+    // now, print the markdown tables
+
+    // Headers
+    println!("\n## Slice");
+    let print_table_header = || {
+        print!("| algo |");
+        for (stage_label, ..) in benchmark_stages {
+            print!(" {stage_label} |");
+        }
+        println!();
+        print!("| -- |");
+        for _ in benchmark_stages {
+            print!(" -- |");
+        }
+        println!();
+    };
+    print_table_header();
+    // | Algo | thrpts... |
+    print!("| std |");
+    for thrpt in slice_thrpts.iter().map(|vec| vec[0]) {
+        print!(" {thrpt:.0} |");
+    }
+    println!();
+    for (idx, (algo_name, ..)) in slice_bench_cases.iter().enumerate() {
+        print!("| {algo_name} |");
+        for thrpt in slice_thrpts.iter().map(|vec| vec[idx + 1]) {
+            print!(" {thrpt:.0} |")
+        }
+        println!();
+    }
+
+    println!("\n## Compressed format");
+    print_table_header();
+    for (idx, (algo_name, ..)) in compressed_bench_cases.iter().enumerate() {
+        print!("| {algo_name} |");
+        for thrpt in compressed_thrpts.iter().map(|vec| vec[idx]) {
+            print!(" {thrpt:.0} |")
+        }
+        println!();
     }
 }
 
