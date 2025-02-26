@@ -931,9 +931,9 @@ fn main() {
             print!(" {stage_label} |");
         }
         println!();
-        print!("| -- |");
+        print!("| :-- |");
         for _ in benchmark_stages {
-            print!(" -- |");
+            print!(" --: |");
         }
         println!();
     };
