@@ -1,10 +1,7 @@
 // only enable avx512 for x86-64 nightly builds
 #![cfg_attr(
-    all(feature = "nightly", target_arch = "x86_64"),
-    feature(avx512_target_feature)
-)]
-#![cfg_attr(
-    all(feature = "nightly", target_arch = "x86_64"),
+    any(feature = "nightly", target_arch = "x86_64"),
+    feature(avx512_target_feature),
     feature(stdarch_x86_avx512)
 )]
 
