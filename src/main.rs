@@ -645,6 +645,77 @@ mod compressed {
             tail(128, input, out);
         }
 
+        #[target_feature(enable = "avx2,bmi1,popcnt")]
+        pub unsafe fn avx2_lut(input: &str, out: &mut LineIndex) {
+            use std::arch::x86_64::{
+                _mm256_cmpeq_epi8 as eq, _mm256_loadu_si256 as load,
+                _mm256_movemask_epi8 as movemask,
+            };
+            /// Precomputed table of 8bit mask -> packed list of 2B indices
+            const LUT: [[u16; 8]; 256] = {
+                let mut t = [[0u16; 8]; 256];
+                let mut t_i = 0;
+                while t_i < 256 {
+                    let mut e = t[t_i];
+                    let mut bit_i = 0;
+                    let mut packed_i = 0;
+                    while bit_i < 8 {
+                        if t_i & (1 << bit_i) != 0 {
+                            e[packed_i] = bit_i;
+                            packed_i += 1;
+                        }
+                        bit_i += 1;
+                    }
+                    t[t_i] = e;
+                    t_i += 1;
+                }
+                t
+            };
+            let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
+            let u16_8_v = _mm_set1_epi16(8);
+            let u16_32_v = _mm_set1_epi16(32);
+            const CHUNK_SIZE: usize = 32;
+            for chunk_64k in input.as_bytes().chunks(1 << 16) {
+                out.high_starts.push(out.lows.len());
+                let mut chunk_i = 0;
+                let stop_chunk_i = chunk_64k.len() / CHUNK_SIZE;
+                let mut offset_v = _mm_setzero_si128();
+                while chunk_i < stop_chunk_i {
+                    let mut write_i = 0;
+                    let iter_count = 32.min(stop_chunk_i - chunk_i);
+                    out.lows.reserve(iter_count * CHUNK_SIZE);
+                    let out_arr = out
+                        .lows
+                        .spare_capacity_mut()
+                        .get_unchecked_mut(..iter_count * CHUNK_SIZE);
+                    for _ in 0..iter_count {
+                        let ptr = chunk_64k.as_ptr().add(chunk_i * CHUNK_SIZE);
+                        let v = load(ptr.cast());
+                        let mask = movemask(eq(nl_v, v));
+                        if mask == 0 {
+                            offset_v = _mm_add_epi16(offset_v, u16_32_v);
+                        } else {
+                            // for each 8bit of mask, lookup, shift, write, adv by popcnt.
+                            for byte in mask.to_le_bytes() {
+                                let mut packed_indices =
+                                    _mm_loadu_si128(LUT.as_ptr().add(byte as usize).cast());
+                                packed_indices = _mm_add_epi16(packed_indices, offset_v);
+                                offset_v = _mm_add_epi16(offset_v, u16_8_v);
+                                _mm_storeu_si128(
+                                    out_arr.as_mut_ptr().add(write_i).cast::<__m128i>(),
+                                    packed_indices,
+                                );
+                                write_i += byte.count_ones() as usize;
+                            }
+                        }
+                        chunk_i += 1;
+                    }
+                    out.lows.set_len(out.lows.len() + write_i);
+                }
+            }
+            tail(64, input, out);
+        }
+
         #[cfg(feature = "nightly")]
         pub fn can_run_avx512_compress() -> bool {
             is_x86_feature_detected!("popcnt")
@@ -747,6 +818,8 @@ fn main() {
 
     let benchmark_stages: &[(&str, fn(&mut Vec<u8>) -> usize)] = &[
         ("single line", |vec| vec.len()),
+        ("0-1", prep_vec_range::<0, 1>),
+        ("0-2", prep_vec_range::<0, 2>),
         ("1-20", prep_vec_range::<1, 20>),
         ("5-20", prep_vec_range::<5, 20>),
         ("10-30", prep_vec_range::<10, 30>),
@@ -819,6 +892,12 @@ fn main() {
             "avx2 intrlv",
             compressed::x86_64::can_run_avx2,
             compressed::x86_64::avx2_unrollx2_interleavex2,
+        ),
+        #[cfg(target_arch = "x86_64")]
+        (
+            "avx2 lut",
+            compressed::x86_64::can_run_avx2,
+            compressed::x86_64::avx2_lut,
         ),
         #[cfg(all(feature = "nightly", target_arch = "x86_64"))]
         (
