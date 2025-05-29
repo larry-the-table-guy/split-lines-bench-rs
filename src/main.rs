@@ -716,6 +716,79 @@ mod compressed {
             tail(64, input, out);
         }
 
+        #[target_feature(enable = "avx2,bmi1,popcnt")]
+        pub unsafe fn avx2_big_lut(input: &str, out: &mut LineIndex) {
+            use std::arch::x86_64::{
+                _mm256_cmpeq_epi8 as eq, _mm256_loadu_si256 as load,
+                _mm256_movemask_epi8 as movemask,
+            };
+            const U16_SIZE: usize = 1 << 16;
+            /// Precomputed table of 16 bit mask -> packed list of 2B indices
+            /// This is slow in const and makes RA a lot slower :(
+            const LUT: &[[u16; 16]; U16_SIZE] = &{
+                let mut t = [[0u16; 16]; U16_SIZE];
+                let mut t_i = 0;
+                while t_i < U16_SIZE {
+                    let mut e = t[t_i];
+                    let mut bit_i = 0;
+                    let mut packed_i = 0;
+                    while bit_i < 16 {
+                        if t_i & (1 << bit_i) != 0 {
+                            e[packed_i] = bit_i;
+                            packed_i += 1;
+                        }
+                        bit_i += 1;
+                    }
+                    t[t_i] = e;
+                    t_i += 1;
+                }
+                t
+            };
+            let nl_v = _mm256_loadu_si256([b'\n'; 32].as_ptr().cast());
+            let u16_16_v = _mm_set1_epi16(16);
+            let u16_32_v = _mm_set1_epi16(32);
+            const CHUNK_SIZE: usize = 32;
+            for chunk_64k in input.as_bytes().chunks(1 << 16) {
+                out.high_starts.push(out.lows.len());
+                let mut chunk_i = 0;
+                let stop_chunk_i = chunk_64k.len() / CHUNK_SIZE;
+                let mut offset_v = _mm_setzero_si128();
+                while chunk_i < stop_chunk_i {
+                    let mut write_i = 0;
+                    let iter_count = 32.min(stop_chunk_i - chunk_i);
+                    out.lows.reserve(iter_count * CHUNK_SIZE);
+                    let out_arr = out
+                        .lows
+                        .spare_capacity_mut()
+                        .get_unchecked_mut(..iter_count * CHUNK_SIZE);
+                    for _ in 0..iter_count {
+                        let ptr = chunk_64k.as_ptr().add(chunk_i * CHUNK_SIZE);
+                        let v = load(ptr.cast());
+                        let mask = movemask(eq(nl_v, v));
+                        if mask == 0 {
+                            offset_v = _mm_add_epi16(offset_v, u16_32_v);
+                        } else {
+                            // for each 8bit of mask, lookup, shift, write, adv by popcnt.
+                            for word in std::mem::transmute::<i32, [u16; 2]>(mask) {
+                                let mut packed_indices =
+                                    _mm_loadu_si128(LUT.as_ptr().add(word as usize).cast());
+                                packed_indices = _mm_add_epi16(packed_indices, offset_v);
+                                offset_v = _mm_add_epi16(offset_v, u16_16_v);
+                                _mm_storeu_si128(
+                                    out_arr.as_mut_ptr().add(write_i).cast::<__m128i>(),
+                                    packed_indices,
+                                );
+                                write_i += word.count_ones() as usize;
+                            }
+                        }
+                        chunk_i += 1;
+                    }
+                    out.lows.set_len(out.lows.len() + write_i);
+                }
+            }
+            tail(64, input, out);
+        }
+
         #[cfg(feature = "nightly")]
         pub fn can_run_avx512_compress() -> bool {
             is_x86_feature_detected!("popcnt")
@@ -898,6 +971,12 @@ fn main() {
             "avx2 lut",
             compressed::x86_64::can_run_avx2,
             compressed::x86_64::avx2_lut,
+        ),
+        #[cfg(target_arch = "x86_64")]
+        (
+            "avx2 big lut",
+            compressed::x86_64::can_run_avx2,
+            compressed::x86_64::avx2_big_lut,
         ),
         #[cfg(all(feature = "nightly", target_arch = "x86_64"))]
         (
