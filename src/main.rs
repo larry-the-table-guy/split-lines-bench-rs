@@ -934,6 +934,7 @@ fn main() {
             |a, b| unsafe { slice::x86_64::avx2_unrollx2(a, b) },
         ),
     ];
+    let slice_bench_cases = &slice_bench_cases.iter().filter(|i| i.1()).collect::<Vec<_>>();
     let compressed_bench_cases: &[(&str, FeatCheckFn, CompressSplitFn)] = &[
         ("iter", || true, compressed::iter),
         #[cfg(target_arch = "x86_64")]
@@ -978,13 +979,14 @@ fn main() {
             compressed::x86_64::can_run_avx2,
             compressed::x86_64::avx2_big_lut,
         ),
-        #[cfg(all(feature = "nightly", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         (
             "avx512",
             compressed::x86_64::can_run_avx512_compress,
             compressed::x86_64::avx512_compress,
         ),
     ];
+    let compressed_bench_cases = &compressed_bench_cases.iter().filter(|i| i.1()).collect::<Vec<_>>();
 
     // this can be done with Vecs, but this is fine
     let mut slice_thrpts = Vec::new();
