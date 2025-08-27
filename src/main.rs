@@ -1,10 +1,3 @@
-// only enable avx512 for x86-64 nightly builds
-#![cfg_attr(
-    any(feature = "nightly", target_arch = "x86_64"),
-    feature(avx512_target_feature),
-    feature(stdarch_x86_avx512)
-)]
-
 mod slice {
     pub fn std(input: &str) -> Vec<&str> {
         input.lines().collect()
@@ -789,7 +782,6 @@ mod compressed {
             tail(64, input, out);
         }
 
-        #[cfg(feature = "nightly")]
         pub fn can_run_avx512_compress() -> bool {
             is_x86_feature_detected!("popcnt")
                 && is_x86_feature_detected!("avx512f")
@@ -798,7 +790,6 @@ mod compressed {
         }
 
         #[inline(never)]
-        #[cfg(feature = "nightly")]
         #[target_feature(enable = "popcnt,avx512f,avx512bw,avx512vbmi2")]
         pub unsafe fn avx512_compress(input: &str, out: &mut LineIndex) {
             const IDX_ARR: [u8; 64] = {
